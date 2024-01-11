@@ -1,0 +1,1059 @@
+---
+title: "Figures_Sendra2023"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+## Load required libraries
+For single cell data processing, plotting and managing dataframes
+
+```{r}
+suppressMessages({
+  
+  # Data Manipulation and Analysis
+  library(openxlsx)        # For reading and writing Excel files
+  library(tidyverse)       # For data manipulation
+  library(magrittr)        # Provides the pipe operator (%>%)
+  library("dgof")          # Statistics KS test compare distributions
+  
+  # Single-cell Analysis
+  library(MouseGastrulationData)  # Custom package for specific mouse gastrulation data
+  library(SingleCellExperiment)   # Represents a single-cell experiment
+  library(Seurat)                 # Tools for single-cell genomics
+  library(Signac)                 # Analyzing single-cell chromatin data
+  library(UCell)                  # Analysis and visualization of single-cell genomics data
+  
+  # Genomic Data Handling
+  library(rtracklayer)   # Handling and manipulating genomic data tracks
+  library(GenomicRanges)  # Representing, transforming, and querying genomic intervals
+  
+  # Data Visualization
+  library(ggplot2)        # Comprehensive plotting package
+  library(gridExtra)      # Combining multiple ggplots into a single plot
+  
+  # Genomic Annotation
+  library(ChIPpeakAnno)   # Annotating ChIP-seq peak data
+  library(ggseqlogo)      # Plot motif sequences
+})
+
+```
+
+```{r}
+sessionInfo()
+```
+
+## Define directories
+They will be relative to wherever this .Rmd file is located at the moment.
+```{r}
+# Define relative paths 
+data <- "../data"        # Where data is loaded from
+figures <- "../figures"  # Where figures are saved
+results <- "../results"  # Where results. For example: a dataframe of marker peaks, a .rds dataframe calculated previous to plotting...
+```
+
+Following the order of Results section
+
+# scRNAseq: Re-analysis of previously published data
+
+## Figures S1_1-4: scRNAseq signature scores
+Gene signatures for established cell types at E8.0-E8.5 plotted in scRNAseq E6.5 data. 
+Primitive streak markers gene expression is depicted at the bottom. scRNAseq data from Pijuan-Sala et al. (2019).
+
+### Download data from MouseGastrulation package
+If it is already downloaded, load it from local.
+```{r}
+# Define the target stages
+target_stages <- c("E6.5", "E6.75", "E7.0", "E7.25")
+
+# Loop over each target stage
+for (target_stage in target_stages) {
+  
+  # Download data from MouseGastrulation package
+  sce_path <- file.path(data, "scRNAseq_PijuanSala2019_MouseGastrulationAtlas", paste0(target_stage, "_sce_subset.rds"))
+  
+  if (!file.exists(sce_path)) {
+    print(paste0(target_stage, " sce dataset does not exist. Downloading from MouseGastrulationData package"))
+    # If the file doesn't exist, proceed with downloading, subsetting, and saving it
+    
+    # Import only samples from the specified stages
+    target_samples <- AtlasSampleMetadata %>%
+      filter(stage %in% target_stage) %>%
+      pull(sample)
+    
+    # Download the data (SingleCellExperiment format, sce) 
+    sce <- EmbryoAtlasData(samples = target_samples)
+    
+    # Define the celltypes you want to keep
+    desired_celltypes <- c('Epiblast', 'Primitive Streak', 'Nascent mesoderm', 'Mixed mesoderm', "ExE mesoderm",
+                           "Anterior Primitive Streak", "Mixed mesoderm", "Haematoendothelial progenitors", 
+                           "Mesenchyme", "Endothelium", "Cardiomyocytes", "Def. endoderm", "Blood progenitors 1",
+                           "Blood progenitors 2")
+    
+    # Subset the sce object based on the desired celltypes
+    sce <- sce[, sce$celltype %in% desired_celltypes]
+    
+    sce %>% 
+      saveRDS(sce_path)
+    
+  } else {
+    # If the file exists, just load it
+    sce <- readRDS(sce_path) # load local file
+  }
+  
+  # Calculate U Scores using Ucell Package
+  scores_path <- file.path(results, paste0(target_stage, "u_scores.rds"))
+  scores_heart_path <- file.path(results, paste0(target_stage, "u_scores_heart.rds"))
+  
+  if (!file.exists(scores_path)) { # compute only if you have not computed it before. It takes some time
+    
+    # import signatures (list of celltype genes)
+    # if signatures ensembl files are not there. you will need to transform gene marker lists to ensembl using this code:
+    # data/scRNAseq_PijuanSala2019_MouseGastrulationAtlas/extract_ensembl_signatures.Rmd"
+    signatures <- readRDS(file.path(data, "scRNAseq_PijuanSala2019_MouseGastrulationAtlas", "signatures_celltype_ensembl.rds"))
+    signatures_heart <- readRDS(file.path(data, "scRNAseq_PijuanSala2019_MouseGastrulationAtlas", "signatures_heart_celltype_ensembl.rds"))
+    
+    # Extract matrix with counts and Ensembl ids from the sce object, necessary to compute UCell scores
+    counts <- assay(sce, "counts")
+    
+    # E6.75 stages needs for some unkown reason this conversion step. Its counts are stored in dgMatrix format and it can't be read by Ucell
+    if (target_stage == "E6.75"){
+    counts <- as.matrix(counts)
+    }
+    
+    # Run ScoreSignatures_UCell and get directly signature scores for all cells
+    u.scores <- ScoreSignatures_UCell(counts, features = signatures)
+    
+    u.scores %>% 
+      saveRDS(file.path(results, paste0(target_stage, "u_scores.rds")))
+    
+    # Run ScoreSignatures_UCell again for heart markers
+    u.scores_heart <- ScoreSignatures_UCell(counts, features = signatures_heart)
+    
+    u.scores_heart %>% 
+      saveRDS(file.path(results, paste0(target_stage, "u_scores_heart.rds")))
+    
+  } else {
+    u.scores <- readRDS(scores_path)
+    u.scores_heart <- readRDS(scores_heart_path)
+  }
+  
+  ### Before plotting UCell scores, plot the celltype map for reference
+  
+  # Define the color palette as a named vector (copied from Pijuan-Sala2019 code)
+  # https://github.com/MarioniLab/MouseGastrulationData
+  
+  # Define the color palette as a named vector (copied from Pijuan-Sala2019 code)
+  celltype_colors <- c(
+    "Epiblast" = "#635547",
+    "Primitive Streak" = "#DABE99",
+    "Nascent mesoderm" = "#C594BF",
+    "Mixed mesoderm" = "#DFCDE4",
+    "ExE mesoderm" = "#8870ad",
+    "Anterior Primitive Streak" = "#c19f70",
+    "Haematoendothelial progenitors" = "#FBBE92",
+    "Mesenchyme" = "#ed8f84",
+    "Endothelium" = "#eda450",
+    "Cardiomyocytes" = "#B51D8D",
+    "Def. endoderm" = "#F397C0",
+    "Blood progenitors 1" = "#f9decf",
+    "Blood progenitors 2" = "#c9a997"
+  )
+  
+  # Extract UMAP coordinates to plot the score of each signature
+  umap_coordinates <- reducedDim(sce, "umap")
+  
+  # Create a data frame for plotting
+  plot_data <- data.frame(
+    UMAP1 = umap_coordinates[, 1],
+    UMAP2 = umap_coordinates[, 2],
+    celltype = colData(sce)$celltype  # Add cell types from colData
+  )
+  
+  # Create the UMAP plot with the combined data and color mapping
+  p <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2, color = celltype)) +
+    geom_point(size = 0.2) +
+    scale_color_manual(values = celltype_colors) +  # Use the custom color palette
+    labs(title = "") + # no title
+    theme_minimal() +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank()
+    )+
+    guides(color = FALSE)  # Remove the color legend, this will be added with adobe illustrator manually
+  
+  # Print the UMAP plot
+  print(p)
+  
+  ggsave(file.path(figures,  paste0(paste(target_stage, collapse = " "), "_Celltypes.png")), plot = p, width = 3, height = 3)
+  
+  
+  ### Plot U Scores for each of the analyzed cell types using ggplot
+  
+  # Plot all celltype scores in all timepoint. Relative scale color to each plot. Even small differences will show up, although they are small compared differences comparing with other cell types.
+  # Function to create a UMAP plot for a specific cell type
+  create_umap_plot <- function(sce, umap_coordinates, u.scores, celltype, ylim_max) {
+    # Create a data frame for plotting
+    plot_data <- data.frame(
+      UMAP1 = umap_coordinates[, 1],
+      UMAP2 = umap_coordinates[, 2],
+      scores = u.scores[, paste0(celltype, "_UCell")]
+    )
+    
+    # Create the UMAP plot with signature score levels
+    p <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2, color = scores
+    )) +
+      geom_point(size = 0.2) +
+      scale_colour_gradient2(
+      low = "#d2d1d4",
+      mid = "#9f7aeb",
+      high = "#0802ff",
+      midpoint = ylim_max/2,
+      na.value = "#d2d1d4",
+      limits = c(0, ylim_max) # in case you want to set a common scale for all celltypes
+      ) + 
+      labs(title = paste(celltype)) +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+            panel.background = element_blank(), axis.line = element_line(colour = "black"), # legend.position = "none"  # Remove the legend
+      )
+    return(p)
+  }
+  
+  # Now plot all cell type signatures together in a grid
+  # ylim_max <- max(u.scores) # in case you want to set a common scale for all celltypes
+  ylim_max <- 0.4 
+  
+  # cell types to loop over
+  celltypes <- names(signatures)
+  
+  # order names in order of gastrulation, ingression to Primitive streak (Tam et al 1997)
+  celltypes <- c("Blood_progenitors1", "Allantois", "Endothelial", "Cardiomyocytes", "Definitive_endoderm", "Caudal_neuroectoderm", "Notochord", "Spinal_cord", "Forebrain_midbrain_hindbrain")
+  
+  # Create a list of plots for each cell type using lapply
+  umap_plots <- lapply(celltypes, create_umap_plot, sce = sce, umap_coordinates = umap_coordinates, u.scores = u.scores, ylim_max = ylim_max)
+  
+  # Number of columns and rows for the grid
+  num_columns <- 3
+  
+  # Create a grid of plots
+  grid_plot <- do.call("grid.arrange", c(umap_plots, ncol = num_columns))
+  
+  # Save the grid of plots to a PNG file with DPI = 600
+  score_type <- deparse(substitute(u.scores))
+  ggsave(file.path(figures, paste0(score_type, target_stage, ".png")), plot = grid_plot, width = , height = 7, dpi = 600)
+
+  # Do the same but only for cardiac scores
+  # ylim_max <- max(u.scores) # in case you want to set a common scale for all celltypes
+  
+  # cell types to loop over
+  celltypes_heart <- names(signatures_heart)
+  
+  # Create a list of plots for each cell type using lapply
+  umap_plots <- lapply(celltypes_heart, create_umap_plot, sce = sce, umap_coordinates = umap_coordinates, u.scores = u.scores_heart, ylim_max = ylim_max)
+  
+  # Number of columns and rows for the grid
+  num_columns <- 1
+  
+  # Create a grid of plots
+  grid_plot <- do.call("grid.arrange", c(umap_plots, ncol = num_columns))
+  
+  # Save the grid of plots to a PNG file with DPI = 600
+  score_type <- deparse(substitute(u.scores_heart))
+  ggsave(file.path(figures, paste0(score_type, target_stage, ".png")), plot = grid_plot, width = 3.5, height = 10, dpi = 600)
+  
+}
+```
+
+
+
+# snATACseq: Our data
+## Figure 1: Epigenetic priming of embryonic lineages in the mouse epiblast
+Single nucleus chromatin accessibility profiling reveals cell type priming in the E6.5 epiblast. Endoderm-like and endothelial-like signatures appear in Epiblast snATACseq clusters
+
+preprocessing steps including quality filter, reference annotation for cell type, epiblast selection, epiblast clustering, diferential peak accessibility between clusters is detailed here:
+data/snATACseq_preprocessing_report
+### B Reference annotation
+![Reference annotation from scRNAseq Pijuan-Sala2019](data/snATACseq_preprocessing_report/scATACseq.analysis.MSendra.v4_files/figure-html/unnamed-chunk-58-1.jpeg)
+
+### C Epiblast clustering
+```{r, fig.height=3,fig.width=4}
+# Import Seurat object for the subset epiblast dataset (5573 cells)
+snATAC_path <- file.path(data, "snATACseq", "scATAC.embryo.Epiblast.seurat_cicero.rds")
+snATAC <- readRDS(snATAC_path)
+
+# Define an order of cluster identities
+order_clusters <- c("C0", "C1", "C2", "C3", "C4")
+
+# Relevel identities so they appear in order in the plots
+snATAC@active.ident <- factor(x = snATAC@active.ident, levels = order_clusters)
+
+# Define colors for the epiblast clusters
+color.epiblast.named <- c("C0" = "#635547",
+                    "C1" = "#3F84AA", 
+                    "C2" = "#DABE99", 
+                    "C3" = "#65A83E", 
+                    "C4" = "#F397C0")
+
+# Plot clusters
+DimPlot(snATAC, cols = color.epiblast.named)
+
+# save the plot
+ggsave(file.path(figures, paste0("snATAC_E6.5_clusters_epiblast", ".png")), width = 4, height = 3, dpi = 600)
+```
+
+
+
+### D Marker peaks
+
+#### Calculate peaks differentially accessible between clusters
+Compute marker peaks with seurat function FindAllmarkers
+
+```{r}
+minPct <- 25  # % of cells that need to have that peak accessible to be considered a marker.
+pval <- 0.01
+
+cluster.markers <- snATAC %>%
+  FindAllMarkers(
+    assay = "peaks"
+    , slot = "data"
+    , min.pct = minPct/100
+    , return.thresh = pval
+    , test.use = "LR"
+    , verbose = T
+    , latent.vars = "nCount_peaks"
+  )
+
+# Select cluster markers with padj_val < 0.01, discard the rest
+cluster.markers.padjval <- cluster.markers %>% 
+  subset(p_val_adj < 0.01)
+```
+
+
+#### Annotate peaks with gene names which TSS lay in the same regulatory region.
+We will use the reference (Shen et al., 2012). This reference considers that every piece of DNA within the same hi-C TAD is able to interact with each other. 
+It takes into account that the same peak (i.e. enhancer) can interact with multiple genes' TSS.
+
+```{r}
+# RDS file that already has the bed annotated with the region and its genes. It is a GRanges object.
+reg <- readRDS(file.path(data, "snATACseq", "regulatory_regions_annot.rds"))
+
+peaks <- cluster.markers.padjval
+
+# This code creates a new column "region" with the values from the "gene" column and then removes the original "gene" column. T
+peaks$region <- peaks$gene
+peaks <- peaks[, -which(names(peaks) == "gene")]
+
+peak.regions <- peaks$region
+
+### Peak annotation
+# Perform peak annotation by finding overlapping regions in the regulatory region annotation
+peak.reg_ids <- sapply(peak.regions, function (x) {subsetByOverlaps(reg, StringToGRanges(x))$reg_id}) 
+
+# Add the regulatory region IDs to the peaks data
+peaks$regulatory_reg <- peak.reg_ids
+peaks$regulatory_reg <- as.character(peaks$regulatory_reg)
+peaks <- peaks %>% mutate(regulatory_reg = ifelse(regulatory_reg == "character(0)", "", regulatory_reg))
+
+# Perform a left join to add additional information from the regulatory regions dataset
+peaks <- peaks %>% 
+  left_join(as.data.frame(reg) %>% 
+              dplyr::select(reg_id, gene_TSS), 
+            by = join_by(regulatory_reg == reg_id))
+
+# Update the "regulatory_reg" column to handle cases where no overlap was found
+peaks <- peaks %>% mutate(regulatory_reg = ifelse(regulatory_reg == "", NA, regulatory_reg)) %>%
+  dplyr::select(cluster, region, everything()) # change order of columns. First cluster, then region then everything else
+
+peaks %>% head()
+
+```
+
+#### Annotate peaks with gene names with closest TSS even if they do not share regulatory region
+Some peaks were not annotated in previous round. create a second annotation column in the cluster.markers dataframe to gather info about the closest gene to the peak. Although the first annotation we did with the regulatory region is more accurate than finding just the closest gene. 
+```{r}
+### Annotate with nearest genes
+# Some peaks do not belong to any of the annotated regulatory regions in the reference. We create a new column that annotates the closest TSS, regardless of the regulatory regions.
+peaks_closestTSS <- peaks %>% 
+  left_join(ClosestFeature(snATAC, regions = peaks$region),
+            by = join_by(region == query_region)) %>%
+  dplyr::rename(pct_cluster = pct.1, pct_rest = pct.2, closest_TSS = gene_name, TSS_in_same_regulatory_region = gene_TSS) %>%    # rename columns
+  dplyr::select(-gene_id, -tx_id) %>% # remove useless columns
+  distinct()                          # remove duplicates               
+
+
+### Add info about position (is the region inside a gene, is it anterior?)
+peaks_closestTSS <- peaks_closestTSS %>% 
+  filter(!is.na(closest_region)) %>%
+  mutate(anterior = StringToGRanges(region) < StringToGRanges(closest_region)) %>%
+  mutate(in_gene_region = distance == 0 | (distance < 2000 & anterior == T)) 
+
+# Order result by fold.enrichment within each cluster
+peaks_closestTSS <- peaks_closestTSS %>%
+  arrange(cluster, desc(avg_log2FC))
+
+# save
+peaks_closestTSS %>%
+  write.table(file.path(results, "Epiblast_clusters_marker_peaks_annotated_reg.tsv"),
+            row.names = F, col.names = T, quote = F, sep = "\t")
+
+peaks_closestTSS %>% head()
+```
+
+#### Plots: Number of marker peaks per cluster
+You can start directly from here skipping the FindMarkers and annotation. Just load the .tsv file with the markers
+```{r}
+marker_peaks_path <- file.path(results, "Epiblast_clusters_marker_peaks_annotated_reg.tsv")
+marker_peaks <- read.delim(marker_peaks_path, sep="\t")
+
+df <- marker_peaks
+
+# KDE plot for the distribution of avg_log2FC on each cluster with a horizontal red line at 0.5
+ggplot(df, aes(x = avg_log2FC, fill = cluster)) +
+  geom_density(alpha = 0.4) +
+  geom_vline(xintercept = 0.5, color = "lightcoral", linetype = "dashed") +
+  geom_vline(xintercept = -0.5, color = "lightcoral", linetype = "dashed") +
+  scale_fill_manual(values = color.epiblast.named) +
+  theme_minimal() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ggtitle("KDE of avg_log2FC for each cluster")
+
+# 2D scatter plot with jitter for avg_log2FC on each cluster
+
+ggplot(df, aes(x = cluster, y = avg_log2FC)) +
+  geom_jitter(aes(color = ifelse(abs(avg_log2FC) < 0.5, "lightgray", "darkblue")), width = 0.2, height = 0, size = 1.5, alpha = 0.6) +
+  geom_hline(yintercept = 0.5, color = "lightcoral", linetype = "dashed") +
+  geom_hline(yintercept = -0.5, color = "lightcoral", linetype = "dashed") +
+  scale_color_identity() +
+  labs(x = "Cluster", y = "avg_log2FC") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 15),
+        axis.title = element_text(size = 15),
+        axis.text = element_text(size = 15),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()) +
+  ggtitle("Accessibility of marker peaks")
+
+# save the plot
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_clusters_marker_peaks_scatter", ".png")), width = 6, height = 4, dpi = 600)
+
+# save marker peaks table keeping only peaks which abs(log2FC) > 0.5
+marker_peaks_log2FC0.5 <- marker_peaks %>% 
+  subset(abs(avg_log2FC) > 0.5)
+
+marker_peaks_log2FC0.5  %>% 
+  write.table(file.path(file.path(results, "Epiblast_clusters_marker_peaks_annotated_reg_log2FC0.5.tsv")),
+            row.names = F, col.names = T, quote = F, sep = "\t")
+
+
+```
+
+### E Plot top marker peaks from clusters
+ (most differentially accesible peak, respectively)
+```{r, fig.width = 6, fig.height = 6}
+top_marker_peaks <- marker_peaks %>% 
+  subset(avg_log2FC > 0.5) %>%
+  group_by(cluster) %>%
+  top_n(1, wt = avg_log2FC) %>% # sort by increasing adjusted p_value
+  ungroup()
+
+top_marker_peaks
+
+p <- FeaturePlot(snATAC, features = top_marker_peaks$region, order = TRUE) & NoLegend() & NoAxes()
+# snATACseq is sparse data, if we do not order, the few cells with accessibility get burried in crowded plots
+
+# Change titles for gene names. Instead of regions, name of cluster and name of the gene
+for (i in 1: length(top_marker_peaks$closest_TSS)) p[[i]]$labels$title = paste0(top_marker_peaks$cluster[i], ": ", top_marker_peaks$closest_TSS[i])
+
+# Now add regions as subtitles
+for (i in 1: length(top_marker_peaks$region)) p[[i]]$labels$subtitle = top_marker_peaks$region[i]
+
+p
+
+# save the plot
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_clusters_top_marker_peaks_UMAP", ".png")), width = 6, height = 6, dpi = 600)
+```
+
+## Figure 1S6: snATACseq promoter coverage, predicted gene expression + cell-type specific peaks
+### Plot foxa2 peak C2
+```{r, fig.width = 3, fig.height = 3}
+FeaturePlot(snATAC, features = "chr2-148099595-148100504", order = TRUE) & NoAxes()
+
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_Foxa2C2_marker_peaks_UMAP", ".png")), width = 3.5, height = 3, dpi = 600)
+
+```
+### Plot Sox9 peak C4
+```{r, fig.width = 3, fig.height = 3}
+FeaturePlot(snATAC, features = "chr11-112501543-112502447", order = TRUE) & NoAxes()
+
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_Sox9C4_marker_peaks_UMAP", ".png")), width = 3.5, height = 3, dpi = 600)
+
+```
+### Plot Notch1 peak C3
+```{r, fig.width = 3, fig.height = 3}
+FeaturePlot(snATAC, features = "chr2-26486571-26487484", order = TRUE) & NoAxes() 
+
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_Notch1_C3_marker_peaks_UMAP", ".png")), width = 3.5, height = 3, dpi = 600)
+
+```
+
+
+
+### RNA predicted expression of gastrulation genes
+https://stuartlab.org/signac/articles/pbmc_vignette
+- Create a gene activity matrix
+
+We plot this to know if our C3 has undergone onset of Mesp1 expression or not.
+We can try to quantify the activity of each gene in the genome by assessing the chromatin accessibility associated with the gene, and create a new gene activity assay derived from the scATAC-seq data. Here we will use a simple approach of summing the fragments intersecting the gene body and promoter region.
+To create a gene activity matrix, we extract gene coordinates and extend them to include the 2 kb upstream region (as promoter accessibility is often correlated with gene expression). We then count the number of fragments for each cell that map to each of these regions, using the using the FeatureMatrix() function. These steps are automatically performed by the GeneActivity() function:
+Calculated previously. data/snATACseq_preprocessing_report
+
+```{r}
+DefaultAssay(snATAC) <- 'peaks'
+
+cov_plot <- CoveragePlot(
+  object = snATAC,
+  region = "Eomes",
+  annotation = TRUE,   # show genes
+  peaks = FALSE,       # do not anotate peaks
+  window = 1000,        # smoothing
+  links = FALSE,
+  #extend.downstream = 2000, # in case of strand - genes
+  extend.upstream = 2000 # in case of strand + genes
+  )
+
+
+cov_plot & scale_fill_manual(values = color.epiblast.named) & NoLegend() & NoAxes()
+
+ggsave(file.path(figures, paste0("Eomes_coverage_TSS_promoter2kb_noleg_noax.png")), width = 3.5, height = 2.5, dpi = 600) 
+
+```
+
+
+```{r, fig.width = 6, fig.height = 5}
+DefaultAssay(snATAC) <- 'RNA'
+
+gastrulation_genes <- c("Fgf8", "Eomes", "T", "Mesp1")
+
+FeaturePlot(snATAC, features = gastrulation_genes, reduction = "umap", order = TRUE) & NoAxes()
+#ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_Foxa2C2_marker_peaks_UMAP", ".png")), width = 3, height = 3, dpi = 600)
+
+```
+```{r, fig.width= 8, fig.height=3}
+# Visualize co-expression of two features simultaneously
+# Get all combinations of 2 items
+gene_combinations <- combn(gastrulation_genes, 2, simplify = TRUE)
+
+# Iterate through combinations and create FeaturePlot
+for (i in seq(ncol(gene_combinations))) {
+  combination <- gene_combinations[, i]
+  p <- FeaturePlot(snATAC, features = combination, reduction = "umap", blend = TRUE, order = TRUE)
+  print(p)
+}
+```
+
+```{r, fig.width = 6, fig.height = 5}
+# Define an order of cluster identities
+order_clusters <- c("C4", "C3", "C2", "C1", "C0")
+
+# Relevel identities so they appear in order in the plots
+snATAC@active.ident <- factor(x = snATAC@active.ident, levels = order_clusters)
+
+RidgePlot(snATAC,
+          cols = color.epiblast.named,
+          features = gastrulation_genes,
+          ncol = 2)
+
+ggsave(file.path(figures, paste0("predicted_expression_gastrulation_genes.svg")), width = 6, height = 5, dpi = 600)
+
+```
+
+
+```{r, fig.width=6, fig.height=6}
+# Put the order back again to normal
+# Define an order of cluster identities
+order_clusters <- c("C0", "C1", "C2", "C3", "C4")
+
+# Relevel identities so they appear in order in the plots
+snATAC@active.ident <- factor(x = snATAC@active.ident, levels = order_clusters)
+
+VlnPlot(snATAC, features = gastrulation_genes, ncol = 2)
+```
+
+
+```{r, fig.width=5, fig.height=3}
+DotPlot(snATAC, features = gastrulation_genes) + RotatedAxis()
+```
+
+
+### F Coverage plot of the whole Nfatc1 regulatory region 
+Plotting from BigWig files obtained from other publications need to be done in a MacOS or Ubuntu. Using Rtracklayer package loading data from bigwigs in Windows is not supported.
+
+```{r}
+DefaultAssay(snATAC) <- 'peaks'
+
+# Define paths where BigWigs are found
+BigWigs_path_Argelaguet <- file.path(data, "other_publications", "Argelaguet2022_snATACseq_E7.5-E8.5_bigwigs_celltype")
+BigWigs_path_Lin <- file.path(data, "other_publications", "Lin2022_ChipSeq_ESC_Mesp1_dox")
+BigWigs_path_Aydin <- file.path(data, "other_publications", "Aydin2022_ChipSeq_ESC_Foxa2")
+
+
+# Find all files with extensions .bw, .bigwig, or similar (case-insensitive)
+BigWigs_Argelaguet <- list.files(BigWigs_path_Argelaguet, pattern = "\\.(bw|bigwig)$", ignore.case = TRUE, full.names = TRUE)
+BigWigs_Lin <- list.files(BigWigs_path_Lin, pattern = "\\.(bw|bigwig)$", ignore.case = TRUE, full.names = TRUE)
+BigWigs_Aydin <- list.files(BigWigs_path_Aydin, pattern = "\\.(bw|bigwig)$", ignore.case = TRUE, full.names = TRUE)
+
+# For our snATACseq data, modify the link to the fragments file, necessary in order to plot coverage tracks
+# Change the reference in the object to the fragments file
+Fragments(snATAC) <- NULL
+
+# path to fragments file and index
+fragments_path <- file.path(data, "snATACseq", "fragments.rds")
+
+# Check if the file already exists
+if (!file.exists(fragments_path)) {
+  # If the file doesn't exist, proceed with creating and saving fragments
+  fragments <- CreateFragmentObject(path = file.path(data, "snATACseq", "fragments.tsv.gz"), validate.fragments = TRUE)
+  saveRDS(fragments, file_path) # save for next time
+} else {
+  # If the file exists, just load it
+  fragments <- readRDS(file.path(data, "snATACseq" , "fragments.rds")) # load fragments data
+}
+
+Fragments(snATAC) <- fragments
+```
+
+Plot coverage of our snATACseq data. E6.5 Epiblast clusters
+
+```{r}
+## Determine what regions you are going to plot for the figures
+Nfatc1_regulatory_region <- StringToGRanges("chr18:80598312-80740511", sep = c(":", "-"))
+  # whole nfatc1 regulatory region extracted from EPUS (Shen et al., 2012)
+
+# Region to plot in the following code:
+region <- Nfatc1_regulatory_region
+
+cov_plot <- CoveragePlot(
+  object = snATAC,
+  region = region,
+  links = FALSE, 
+  annotation = TRUE,   # show genes
+  peaks = FALSE,       # do not anotate peaks
+  window = 1000        # smoothing
+  )
+
+# the color.epiblast vector contains only 5 items
+
+cov_plot & scale_fill_manual(values = color.epiblast.named)
+
+#ggsave(file.path(path, "cov_plot_epiblast_Sendra_region1.svg"), width = 5, height = 5)
+ggsave(file.path(figures, paste0("snATAC_E6.5_epiblast_clusters_coverage_plot", ".png")), width = 5, height = 3, dpi = 600)
+```
+
+
+(This chunk will not work on windows OS.)
+
+Lin snATACeq clusters
+time: 12hours_after_d2-5
+condition: dox
+cell type: embryonic pluripotent stem cells
+Treatment protocol	Doxycycline was added to induce the expression of Mesp1 or Zic3
+Growth protocol	Pluripotent stem cells were differentiated using published hanging drop protocols (1000 initial cells in serum-condtining medium)
+
+```{r}
+if(.Platform$OS.type != "windows"){
+    
+    color.arguelaguet <- c(
+  "gray", # Epiblast
+  "lightgray",  # PS
+  "#13bcc2",  # endothelium
+  "#f3756d"  # myocardium 
+)
+
+# Argelaguet 2022 snATACeq clusters
+cov_plot <- BigwigTrack(
+  region = region,
+  bigwig = BigWigs_Argelaguet,
+  smooth = 1000,
+  )
+
+cov_plot + scale_fill_manual(values = color.arguelaguet) + theme(legend.position="none") +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank() 
+        )
+
+ggsave(file.path(figures, paste0("snATAC_E7.5-E8.5_Argelaguet2022_clusters_coverage_plot_bw", ".png")), width = 5, height = 2.5, dpi = 600)
+
+# Lin snATACeq clusters from d2-5 + 12h ESC differentiation to Embryoid bodies
+
+cov_plot <- BigwigTrack(
+  region = region,
+  bigwig = BigWigs_Argelaguet,
+  smooth = 1000,
+  )
+
+cov_plot + scale_fill_manual(values = rep("darkblue", 4)) + theme(legend.position="none") +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank() 
+        )
+
+}else{
+  print("bigWig track is not suported on Windows")
+}
+
+
+
+```
+
+## Figure S1_5: : Supplementary to snATACseq E6.5
+
+### A H3K27 acetilation around snATACseq E6.5 marker peaks in ESCells before and after Mesp1 expression.
+I downloaded the BigWig files of the Mesp1 and H3K2chipseqs
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE165107
+GSM5026170	Mesp1-ChIP-seq-12h-dox
+GSM5026172	H3K27Ac-ChIP-seq-12h-no-dox
+GSM5026173	H3K27Ac-ChIP-seq-12h-dox
+
+and followed this tutorial:
+https://bioconductor.org/packages/release/bioc/vignettes/ChIPpeakAnno/inst/doc/ChIPpeakAnno.html
+Section: Create heatmap for given feature/peak ranges
+
+```{r}
+# Load marker peaks table
+marker_peaks_path <- file.path(results, "Epiblast_clusters_marker_peaks_annotated_reg_log2FC0.5.tsv")
+marker_peaks_log2FC0.5 <- read.delim(marker_peaks_path, sep="\t")
+
+feature.recentered_path <- file.path(results, "chip_anno_feature.recentered_peaks.RDS")
+sig_n_path <- file.path(results, "chip_Mesp1_sig_n.RDS")
+
+if (!file.exists(feature.recentered_path) & !file.exists(sig_n_path)) { # if they do not exist, compute them
+  # convert peak region strings to GRanges object
+  features <- marker_peaks_log2FC0.5$region %>%
+    StringToGRanges(sep = c("-", "-"))
+  
+  # add cluster info to metadata
+  features$cluster <- marker_peaks_log2FC0.5$cluster
+  
+  # Recenter coordinates with +- 2000bp upstream and downstream
+  wid <- width(features)
+  feature.recentered <- feature.center <- features
+  start(feature.center) <- start(features) + floor(wid/2)
+  width(feature.center) <- 1
+  start(feature.recentered) <- start(feature.center) - 2000
+  end(feature.recentered) <- end(feature.center) + 2000
+  
+  feature.recentered %>%
+    saveRDS(file.path(results, "chip_anno_feature.recentered_peaks.RDS"))
+  
+  chip_bigwig_path <- file.path(data, "other_publications", "Lin2022_ChipSeq_ESC_Mesp1_dox")
+  chip_files <- list.files(chip_bigwig_path)
+  
+  # import signal around feature.recentered (our peaks) ranges
+  cvglists <- sapply(file.path(chip_bigwig_path, chip_files), import,
+                         format="BigWig",
+                         which=feature.recentered,
+                         as="RleList")
+  
+  # save chip track around our peaks
+  cvglists %>% 
+    saveRDS(file.path(results, "chip_Mesp1_cvglists.RDS"))
+  
+  # process signal so it can be plotted in stripplot with ChIPpeakAnno.
+  # Basically what it does is 100 bins, such as an histogram
+  sig <- cvglists %>% 
+    ChIPpeakAnno::featureAlignedSignal(
+      feature.recentered,
+      upstream = 2000, 
+      downstream = 2000
+    )
+  
+  # Log2 normalize signal
+  sig_n <- sig %>% lapply(\(x) log2(x + 1))
+  
+  # Save
+  sig_n %>%
+    saveRDS(file.path(results, "chip_Mesp1_sig_n.RDS"))
+  
+} else { # if exists, load it
+  feature.recentered <- readRDS(file.path(results, "chip_anno_feature.recentered_peaks.RDS"))
+  sig_n <- readRDS(file.path(results, "chip_Mesp1_sig_n.RDS"))
+  }
+```
+
+
+#### Create heatmap for given feature/peak ranges
+Visualize and compare the binding patterns of raw signals of multiple ChIP-Seq experiments using function featureAlignedHeatmap and featureAlignedDistributio from package ChipSeqAnno
+
+```{r, fig.height = 7, fig.width=7}
+chip_bigwig_path <- file.path(data, "other_publications", "Lin2022_ChipSeq_ESC_Mesp1_dox")
+chip_files <- list.files(chip_bigwig_path)
+
+# Change names to filenames without extention
+names(sig_n) <- gsub(".bw", "", chip_files)
+
+# Calculate a new slot for the difference between H3K27Ac-12hdox (+Mesp1 induction) and H3K27Ac-12hnodox
+sig_n$H3K27Ac.subtract <- sig_n$`H3K27Ac-12h-dox` - sig_n$`H3K27Ac-12h-nodox`
+
+# You can specify exactly what tracks you want to plot. We can plot them all by doing his
+keep <- names(sig_n)  # select all names
+
+# use this to select the ones you want or change order
+keep <- c("Mesp1-12h-dox", "H3K27Ac-12h-nodox","H3K27Ac-12h-dox", "H3K27Ac.subtract")
+
+# Create new column in metadata named color that maps the cluster. PURPLE
+feature.recentered$color <- color.epiblast.named[as.character(marker_peaks_log2FC0.5$cluster)]
+
+heatmap <- featureAlignedHeatmap(sig_n[keep], feature.recentered,
+                                 upstream=2000, downstream=2000,
+                                 annoMcols = "color", gap = 0.01,
+                                 color = grDevices::colorRampPalette(c("white", "magenta4"))(50), 
+                                 # lower.extreme = c(0, 0, 0, 0),
+                                 # sortBy = # Default is that all strips are ordered according to the signal of the first one
+                                 # upper.extreme = c(7, 7, 7, max(sig_n$subtract))
+                                 )
+
+# Save in svg as well because we need to move around text and make axis more beautiful in Adobe illustrator
+heatmap %>% ggsave(file.path(figures, "stripplot_Mesp1_H3K27Ac_chip_subtract_purple.png"), plot = ., width = 6, height = 5, units = "in")
+heatmap %>% ggsave(file.path(figures, "stripplot_Mesp1_H3K27Ac_chip_subtract_purple.svg"), plot = ., width = 6, height = 5, units = "in")
+
+# Create new column in metadata named color that maps the cluster. PURPLE
+heatmap <- featureAlignedHeatmap(sig_n[keep], feature.recentered,
+                                 upstream=2000, downstream=2000,
+                                 annoMcols = "color", gap = 0.01,
+                                 color = grDevices::colorRampPalette(c("darkblue","white", "red2"))(50), 
+                                 # lower.extreme = c(0, 0, 0, 0),
+                                 # sortBy = # Default is that all strips are ordered according to the signal of the first one
+                                 # upper.extreme = c(7, 7, 7, max(sig_n$subtract))
+      
+                                 )
+heatmap %>% ggsave(file.path(figures, "stripplot_Mesp1_H3K27Ac_chip_subtract_darkblue_red2.png"), plot = ., width = 6, height = 5, units = "in")
+heatmap %>% ggsave(file.path(figures, "stripplot_Mesp1_H3K27Ac_chip_subtract_darkblue_red2.svg"), plot = ., width = 6, height = 5, units = "in")
+
+```
+#### Plotting distributions of aligned signals to summarize what is seen in each column of the stripplot. 
+There is no way to separate diferent chips on featureAlignedDistribution (as far as I know)
+So we will iterate over each chip data item in sig_n and plot the distributions separated by cluster.
+
+```{r, fig.width = 4, fig.height = 4}
+# same scales for all plots helps comparing the different chips
+ylim_max <- 5
+
+clusters <- unique(feature.recentered$cluster)
+# change order
+sig_n <- sig_n[keep]
+
+for (chip in names(sig_n)) {
+  # Select one chip at a time
+  sig_n.chip <- sig_n[[chip]]
+  
+  # Create a list to store subsets
+  subset_list <- list()
+  
+  # Subset sig_n matrix for each cluster and store in the list
+  for (cluster in clusters) {
+    indices <- which(feature.recentered$cluster == cluster)
+    subset_list[[cluster]] <- sig_n.chip[indices, ]
+  }
+  
+  suppressWarnings(
+  distribution <- featureAlignedDistribution(subset_list, feature.recentered,
+                           upstream=2000, downstream=2000,
+                           type="l", col = color.epiblast.named[2:5],
+                           main = chip, # plot title
+                           ylim = c(0, ylim_max), # common limit for all chips helps visualize better the change (Same scale)
+                           lwd = 2,    # Line width
+                           lty = 1)  # Line type 
+  )
+  # Save plots
+  # dev.print(svg, file = file.path(figures, paste0("distribution_", chip, ".svg")), width = 3, height = 3)
+  # dev.off()  # Close the SVG device
+}
+
+```
+
+#### Percentage of peaks which H3K27Ac is afected by Mesp1 induction on ESC on each cluster
+
+```{r}
+# Calculate the row-wise averages
+row_averages <- rowMeans(sig_n$H3K27Ac.subtract)
+
+# Plot the distribution of row averages
+hist(row_averages, main = "Distribution of Row Averages", xlab = "Row Average", col = "lightblue", border = "black")
+
+# Add vertical lines for visualizing thresholds
+abline(v = 1, col = "red", lty = 2, lwd = 2)  # You can adjust this threshold line as needed
+
+# Summary statistics
+summary(row_averages)
+
+# Set the threshold
+threshold <- 1
+
+# Find the indices of rows whose average is above the threshold
+selected_rows <- which(row_averages > threshold)
+
+# Create a new column 'Mesp1affected' with initial values as "no"
+marker_peaks_log2FC0.5$Increased_H3K27Ac_upon_Mesp1 <- "no"
+
+# Update the rows that are in 'selected_rows' to "yes"
+marker_peaks_log2FC0.5$Increased_H3K27Ac_upon_Mesp1[selected_rows] <- "yes"
+
+# Write the markers file with a new column named Increased_H3K27Ac_upon_Mesp1 frame to an Excel file
+marker_peaks_log2FC0.5 %>%
+  write.table(file.path(results, "marker_peaks_Increased_H3K27Ac_upon_Mesp1.tsv"),
+              row.names = F, col.names = T, quote = F, sep = "\t")
+
+# Select the rows using indices and then group by cluster
+marker_peaks_log2FC0.5[selected_rows, ]
+
+genes <- c("Nfatc1", "Rftn1", "Pla2g6", "Erc2", "Tenm4", "Notch1", "Itga6", "Gm20388", "Rimbp2", "Rasgrp3",
+           "Fam120b", "Snai1", "Aplnr", "Pex26", "Zfp36l2", "Braf", "Dgkg", "Limch1", "S1pr5", "Mrps33",
+           "Pdgfra", "Tenm4", "Rai14", "Ptp4a3", "Vxn", "Klhl42", "Gpc5", "Fn1", "Wdtc1", "Sp5", "Slc43a1",
+           "Col13a1", "Bcl2l1")
+
+# Remove quotes and numbers and create a comma-separated list
+gene_list <- paste(genes, collapse = ', ')
+
+gene_list
+
+# Count the number of selected genes for each cluster
+selected_counts <- table(feature.recentered$cluster[selected_rows])
+
+# Calculate the percentage of selected genes for each cluster
+total_peaks_per_cluster <- table(feature.recentered$cluster)
+percentage_selected <- (selected_counts / total_peaks_per_cluster[1:3]) * 100  
+
+# select only the colors of the represened clusters 
+custom_colors <- color.epiblast.named[names(percentage_selected)]
+
+# Reverse the order of rows
+percentage_selected <- rev(percentage_selected)
+custom_colors <- rev(custom_colors)
+
+# Create a horizontal bar plot showing the percentage of affected genes
+barplot(percentage_selected, horiz = TRUE, col = custom_colors,
+        xlab = "Percentage of affected marker peaks", ylab = "cluster")
+
+# Save the bar plot
+# dev.print(svg, file = file.path(figures, "perc_H3K27Ac_affected_peaks_cluster_upon_Mesp1.svg"), width = 4, height = 4)
+# dev.off()
+```
+
+### B Motif enrichment analysis with Chromvar
+Calculated previously. data/snATACseq_preprocessing_report
+
+```{r}
+# Load data with enriched motifs calculated with ChromVar
+motif_enrichment <- readRDS(file.path(data, "snATACseq", "motifs.DEvsAll.peaks.Epiblast2.All.peaks_snn_res.0.5.mod.5.LR.rds"))
+
+# The excel contains all motifs in all cluster
+# First filter significant ones to get the marker motifs
+
+# Filter significant motifs
+significant_motifs <- motif_enrichment %>%
+  filter(p.adjust < 0.05)
+
+# Count the number of clusters each motif is associated with
+motif_counts <- significant_motifs %>%
+  group_by(motif) %>%
+  summarise(num_clusters = n_distinct(cluster))
+
+# Filter motifs exclusive to one cluster
+exclusive_motifs <- motif_counts %>%
+  filter(num_clusters == 1) %>%
+  pull(motif)
+
+# Filter rows in motif_enrichment based on exclusive_motifs
+exclusive_enrichment <- significant_motifs %>%
+  filter(motif %in% exclusive_motifs)
+
+# Order result by fold.enrichment within each cluster
+exclusive_enrichment_ordered <- exclusive_enrichment %>%
+  arrange(cluster, desc(fold.enrichment))
+
+# Write the ordered enrichment to a CSV file
+write.csv(exclusive_enrichment_ordered, file.path(results, "exclusive_TF_motif_enrichment_ordered.csv"))
+
+# Print top 3 of each cluster
+exclusive_enrichment_ordered %>%
+  group_by(cluster) %>%
+  slice_head(n = 3)
+```
+
+#### Plot top motif for every cluster
+```{r, fig.width= 6, fig.height=6}
+top_n <- 4
+
+# Get unique clusters
+clusters <- unique(exclusive_enrichment_ordered$cluster)
+
+# Initialize a list to store individual plots
+plot_list <- list()
+
+# Loop through each cluster
+for (cluster_id in clusters) {
+  
+  # Extract top motifs for the current cluster
+  marker_motifs <- exclusive_enrichment_ordered %>%
+    filter(cluster == cluster_id) %>%
+    head(n = top_n)  %>%
+    pull(motif)
+
+  
+  marker_names <- exclusive_enrichment_ordered %>%
+    filter(cluster == cluster_id) %>%
+    head(n = top_n) %>%
+    pull(motif.name)
+  
+  
+  # Create FeaturePlot for the current cluster
+  p <- snATAC %>%
+    FeaturePlot(features = marker_motifs, min.cutoff = 'q10', max.cutoff = 'q90') & NoLegend() & NoAxes()
+  
+  # Change titles for gene names on each feature of the featureplot
+  for (i in 1:length(marker_names)) p[[i]]$labels$title = marker_names[i]
+  
+  # Add the current cluster's plot to the list
+  plot_list[[length(plot_list) + 1]] <- p
+
+}
+
+# Arrange the plots in a grid
+grid_arrange <- plot_list %>%
+  grid.arrange(grobs = ., ncol = 2)
+
+# Save the combined grid plot
+ggsave(file.path(figures, "Top_enriched_motifs_per_cluster.png"), plot = grid_arrange, dpi = 600, width = 6, height = 6)
+```
+
+#### Plot top expressed
+selected representative for each cluster, considering its expression at this stage in other scRNAseq datasets
+
+```{r}
+# Write here the TF which motif enrichment you want to plot
+top_selected_names <- c("FOXA2", "GATA2", "SOX9")
+
+top_selected_motifs <- exclusive_enrichment %>%
+  filter(motif.name %in% top_selected_names) %>%
+  pull(motif)
+
+p <- snATAC %>%
+  FeaturePlot(features = top_selected_motifs, min.cutoff = 'q10', max.cutoff = 'q90') & NoLegend() & NoAxes()
+
+# Change titles for gene names on each feature of the featureplot
+for (i in 1:length(top_selected_names)) p[[i]]$labels$title = top_selected_names[i]
+
+p
+
+# Save the combined grid plot
+ggsave(file.path(figures, "Top_enriched_selected_motifs_per_cluster.png"), plot = p, dpi = 600, width = 6, height = 6)
+```

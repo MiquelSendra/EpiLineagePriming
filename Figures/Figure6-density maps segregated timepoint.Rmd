@@ -1,0 +1,192 @@
+---
+title: "Segregated timepoints and density"
+output: html_document
+date: "2023-10-20"
+---
+
+## R Markdown
+
+```{r cars}
+library(Seurat)
+library(ggplot2)
+library(gridExtra)
+
+```
+
+```{r}
+# Define relative paths 
+data <- "./data"        # Where data is loaded from
+figures <- "./figures"  # Where figures are saved
+
+tracking_results <- file.path(data, "live_imaging", "KM1_KM2_tracking_extended_withDists.csv_SO5_final.rds")
+
+trc <- readRDS(tracking_results)
+```
+
+
+## Including Plots
+
+
+```{r, echo=FALSE, fig.width=4, fig.height=3}
+DimPlot(trc,reduction = "tSNE.Final", group.by = "cell_type")
+```
+```{r}
+tsne_coordinates <-  Embeddings(object = trc[["tSNE.Final"]])[(colnames(trc)), c(1, 2)]
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  tsne1 = tsne_coordinates[, 1],
+  tsne2 = tsne_coordinates[, 2],
+  celltype = trc$cell_type
+)
+
+
+p <- ggplot(plot_data) + 
+  geom_point(aes(x = tsne1, y = tsne2), color = "#F0F0F0") +
+  geom_density2d(aes(x = tsne1, y = tsne2, col = celltype)) +
+  theme_minimal() +
+    xlim(-30, 30) +
+  ylim(-30, 30) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+  )
+p
+```
+
+
+```{r}
+p <- ggplot(plot_data) + 
+  geom_point(aes(x = tsne1, y = tsne2), color = "#F0F0F0") +
+  geom_density_2d_filled(aes(alpha = after_stat(level), x = tsne1, y = tsne2, fill = celltype)) +
+  theme_minimal() +
+  xlim(-30, 30) +
+  ylim(-30, 30) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+p
+
+ggsave(file.path(path_out, "density.png"), plot = p, width = 8, height = 6, dpi = 600)
+ggsave(file.path(path_out, "density.svg"), plot = p, width = 8, height = 6)
+
+
+```
+
+
+Now segregate by timepoint
+
+
+```{r,fig.width=12, fig.height=3, echo=FALSE}
+# Define the time chunks (time ranges)
+chunks <- list(c(0, 63), c(63, 126), c(126, 189), c(189, 252))
+
+# Convert the 'timepoint' factor to numeric
+trc$timepoint <- as.numeric(as.character(trc$timepoint))
+
+# Initialize an empty list to store subsets
+subsets <- list()
+
+# Initialize an empty list to store plots
+plots <- list()
+
+# Loop through each time chunk and create plots
+for (i in 1:length(chunks)) {
+  # Subset the Seurat object for cells within the current time chunk
+  subset <- trc[, trc$timepoint >= chunks[[i]][1] & trc$timepoint < chunks[[i]][2]]
+  
+  # Create a DimPlot for the subset
+  p <- DimPlot(subset, reduction = "tSNE.Final", group.by = "cell_type")
+  
+  
+  # Store the plot in the list
+  plots[[i]] <- p
+  subsets[[i]] <- subset
+}
+
+grid.arrange(grobs = plots, ncol = 4, heights = 2) ## display plot
+
+# Initialize an empty list to store plots
+plots <- list()
+for (i in 1:length(subsets)) {
+  
+  p <- ggplot(plot_data) + 
+  geom_point(aes(x = tsne1, y = tsne2), color = "#F0F0F0") +
+  geom_density_2d_filled(aes(alpha = after_stat(level), x = tsne1, y = tsne2, fill = celltype)) +
+  theme_minimal() +
+  xlim(-30, 30) +
+  ylim(-30, 30) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank()
+  )
+}
+
+grid.arrange(grobs = plots, ncol = 4, heights = 2) ## display plot
+
+```
+
+Plot time segregated density maps
+
+```{r,fig.width=12, fig.height=3, echo=FALSE}
+# Initialize an empty list to store plots
+plots <- list()
+
+for (i in 1:length(subsets)) {
+  tsne_coordinates <-  Embeddings(object = subsets[[i]][["tSNE.Final"]])[(colnames(subsets[[i]])), c(1, 2)]
+  
+  # Create a data frame for plotting
+  plot_data <- data.frame(
+  tsne1 = tsne_coordinates[, 1],
+  tsne2 = tsne_coordinates[, 2],
+  celltype = subsets[[i]]$cell_type
+)
+  
+  p <- ggplot(plot_data) + 
+  geom_point(aes(x = tsne1, y = tsne2), color = "#F0F0F0") +
+  geom_density_2d_filled(aes(alpha = after_stat(level), x = tsne1, y = tsne2, fill = celltype)) +
+  theme_minimal() +
+  xlim(-30, 30) +
+  ylim(-30, 30) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none"
+  ) 
+
+
+plots[[i]] <- p
+
+}
+
+p <- grid.arrange(grobs = plots, ncol = 4, heights = 2) ## display plot
+ggsave(file.path(path_out, "density_time.png"), plot = p, width = 32, height = 6, dpi = 600)
+ggsave(file.path(path_out, "density_time.svg"), plot = p, width = 32, height = 6)
+
+
+```
+
