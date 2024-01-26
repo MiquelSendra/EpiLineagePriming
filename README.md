@@ -3,6 +3,10 @@ Repository accompaining the paper "Epigenetic priming of embryonic lineages in t
 
 ## Shiny app for data Browsing
 Interactive data browser. Check snATACseq accessibility in the E6.5 epiblast and 4D live imaging of mesodermal progenitors.
+We are currently working on hosting the App in a web server. For now, download the app to use it in your computer (R/Rstudio). Download the folder, run "install_packages.R" in your R session. Change working directory. Open ui.R, server.R and run the app.
+<a href='https://drive.google.com/drive/folders/1nI6Qtt0Jl4oV2VSEJVIRKyieK7SgpU2Z?usp=sharing'>Link to Drive folder</a></p><br>
+![image](https://github.com/MiquelSendra/EpiLineagePriming/assets/63929719/e840223d-7bf2-45a1-9e20-41d08211d607)
+
 
 ## Download Source Data
 Download Seurat objects of preprocessed snATACseq, 4D cell behaviour data and IGV browser ATACseq tracks from our Drive folder.<br>
