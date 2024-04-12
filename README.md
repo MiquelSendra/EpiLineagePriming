@@ -3,7 +3,8 @@ Repository accompaining the paper "Epigenetic priming of embryonic lineages in t
 
 ## Shiny app for data Browsing
 Interactive data browser. Check snATACseq accessibility in the E6.5 epiblast and 4D live imaging of mesodermal progenitors.
-<a href='[https://drive.google.com/drive/folders/1nI6Qtt0Jl4oV2VSEJVIRKyieK7SgpU2Z?usp=sharing](https://bioinfo.cnic.es/EpiLineagePriming/)'>Link to Shiny App</a></p><br>
+[https://bioinfo.cnic.es/EpiLineagePriming/](https://bioinfo.cnic.es/EpiLineagePriming/)
+
 ![image](https://github.com/MiquelSendra/EpiLineagePriming/assets/63929719/e840223d-7bf2-45a1-9e20-41d08211d607)
 
 
