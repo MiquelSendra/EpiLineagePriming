@@ -1,0 +1,2084 @@
+---
+title: "Track Analysis Example"
+author: "DJC"
+date: "13/10/2023"
+output:
+  html_document: 
+    number_sections: yes
+    self_contained: yes
+    theme: united
+    toc: yes
+    toc_depth: 6
+    toc_float:
+      collapsed: no
+urlcolor: blue
+classoption: a4paper
+header-includes:
+- \usepackage{graphicx}
+- \usepackage{float}
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+knit: (function(inputFile, encoding) {rmarkdown::render(inputFile, encoding = encoding, output_dir = "S:/LAB_MT/RESULTADOS/U_Bioinformatica/MSendra/Dani_Tracking4D/DJC_v3_extended")})
+---
+
+
+# DATA
+
+
+```{r pack2, message=FALSE, warning=FALSE, include=FALSE}
+library( celltrackR )
+library( ggplot2 )
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(plyr)
+library(Seurat)
+library(pals)
+library(DataExplorer)
+library(gridExtra)
+library(kneedle)
+library(clustree)
+library(lme4)
+library(lmerTest)
+library(margins)
+library(ComplexHeatmap)
+library(scatterplot3d)
+library(fractaldim)
+library(tidyverse)
+
+```
+
+
+
+
+
+```{r include=FALSE}
+path_track <- "S:/LAB_MT/RESULTADOS/U_Bioinformatica/MSendra/Dani_Tracking4D/DJC_v3_extended"
+file_track <- "KM1_tracking_extended_withDists.csv"
+tcells <- read.csv(file.path(path_track, file_track))
+```
+
+
+```{r setup, include=FALSE}
+dir.create(file.path(path_track,"Plots"),recursive = T)
+
+knitr::opts_chunk$set(
+  fig.path = paste0(file.path(path_track,"Plots"),'/'), # "Plots/",#
+  dev = c("jpeg", "postscript"),
+  echo = F,
+  fig.align = "center",
+  fig.pos = "H",
+  fig.width = 7,
+  fig.height = 4.3,
+  fig.retina = 2*300/92,
+  dpi=92,
+  message = F,
+  warning = F,
+  comment = NA
+)
+
+```
+
+
+
+```{r}
+knitr::kable(head(tcells,20), 
+             caption = paste0("(Exemplary) Input data: ", nrow(tcells), " x ", ncol(tcells)),
+             row.names = T,
+             digits = 100,
+             booktabs = TRUE, 
+             longtable = TRUE) %>%
+      kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                    fixed_thead = TRUE,
+                    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                    position = "center") %>%
+  kableExtra::scroll_box(height = "400px")
+
+```
+
+
+\
+
+# Parse data
+
+
+* Parse predecessors and successors
+* Select cells that are final points (no successors)
+* Repeat process for each final cell to create independent tracks
+
+```{r}
+tcells_rep <- tcells %>% 
+  dplyr::mutate(successorsNum = str_replace_all(.$successors,'\\[|\\]','')) %>%
+  tidyr::separate_rows(successorsNum,sep = ', ',convert = T) %>% 
+  dplyr::mutate(predecessorsNum = str_replace_all(.$predecessors,'\\[|\\]','')) %>%
+  tidyr::separate_rows(predecessorsNum,sep = ', ',convert = T)
+     
+tcells_rep <- tcells_rep %>% dplyr::select(!c(successors,predecessors))
+```
+
+
+
+
+
+```{r}
+#End points = no successor
+ids_final <- tcells_rep$node_id[which(is.na(tcells_rep$successorsNum))]
+
+```
+
+
+
+```{r include=FALSE}
+
+if (file.exists(file.path(path_track, paste0(file_track,"_alltracks.csv")))){
+  tcells_final2 <- read.csv(file.path(path_track, paste0(file_track,"_alltracks.csv")),
+                            row.names = 1)
+}else{
+  tcells_final <- tcells_rep[tcells_rep$node_id %in% ids_final,]
+  
+  n_final_cells <- length(ids_final)
+  
+  for (id in ids_final){
+    print(paste0("Processing cell ", which(ids_final==id), " out of ", length(ids_final)))
+    new_timepoints <- id
+    new_trackname <- tcells_rep$track_name[which(tcells_rep$node_id == id)][1]
+    while (length(new_timepoints)>0){
+      
+      id2 <- new_timepoints[1]
+      new_timepoints <- new_timepoints[-1]
+      tcells_i <- tcells_rep[which(tcells_rep$successorsNum == id2),]
+      
+      new_timepoints <- append(new_timepoints, tcells_i$node_id)
+      
+      tcells_i$node_id <- id
+      tcells_i$track_name <- new_trackname
+  
+      tcells_final <- rbind(tcells_final, tcells_i)
+    }
+    
+  }
+}
+
+```
+
+
+
+```{r}
+if (file.exists(file.path(path_track, paste0(file_track,"_alltracks.csv")))){
+  tcells_final2 <- read.csv(file.path(path_track, paste0(file_track,"_alltracks.csv")),
+                            row.names = 1)
+}else{
+    
+  tcells_final2 <- tcells_final
+  tcells_final2$successorsNum <- NULL
+  tcells_final2$predecessorsNum <- NULL
+  tcells_final2 <- tcells_final2[!duplicated(tcells_final2), ]
+  
+  tcells_final2 <- tcells_final2[
+    with(tcells_final2, order(timepoint,node_id)),
+  ]
+
+  write.csv(tcells_final2,file.path(path_track, paste0(file_track,"_alltracks.csv")))
+}
+```
+
+
+
+```{r}
+knitr::kable(head(tcells_final2[with(tcells_final2, order(node_id,timepoint)),]
+                  ,500), 
+             caption = paste0("All tracks [",
+                              nrow(tcells_final2),
+                              " x ",
+                              ncol(tcells_final2),
+                              "] (first 500 rows)"
+             ),
+             row.names = T,
+             digits = 100,
+             booktabs = TRUE, 
+             longtable = TRUE) %>%
+      kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                    fixed_thead = TRUE,
+                    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                    position = "center") %>%
+  kableExtra::scroll_box(height = "400px")
+
+
+
+
+```
+
+
+
+
+\
+
+# Convert to tracks
+
+```{r}
+if (file.exists(file.path(path_track, paste0(file_track,"_trackcells.rds")))){
+  trackcells <- readRDS(file.path(path_track, paste0(file_track,"_trackcells.rds")))
+}else{
+  cellpops <- unique(tcells_final2$cell_type)
+  
+  trackcells <- lapply(unique(tcells_final2$cell_type), FUN = function(x){
+    as.tracks(tcells_final2[tcells_final2$cell_type==x,]
+              ,id.column = 1
+              ,time.column = 7
+              ,pos.columns = 3:5)
+  })
+  names(trackcells) <- unique(tcells_final2$cell_type)
+  
+  saveRDS(trackcells,file = file.path(path_track, 
+                           paste0(file_track,"_trackcells.rds")))
+}
+
+```
+
+
+
+
+```{r eval=FALSE, fig.asp=1, include=FALSE}
+plot( trackcells$CM, main = "CM", lwd=2, cex=0.75,
+      col=alpha(as.factor(1:length(trackcells$CM)), 0.2) )
+legend("topright", inset=c(-0.2,0), legend=names(trackcells$CM), col=colors()[as.factor(1:length(trackcells$CM))])
+```
+
+\
+
+## 2D track visualization
+
+
+```{r, fig.asp=1}
+
+old_par  <- par()
+par(mar=c(5, 4, 4, 8), xpd=TRUE, cex = 1)
+
+plot( trackcells$CM, main = "CM", lwd=1, cex=0.25, pch.start = 1, pch.end = NULL, pch=19,
+      col=alpha(as.factor(1:length(trackcells$CM)),0.7) ) 
+par(cex = 0.5)
+legend("topright", inset=c(-0.2,0), legend=names(trackcells$CM), pch=19, col=as.factor(1:length(trackcells$CM)))
+
+par(mar=old_par$mar, xpd=old_par$xpd, cex=old_par$cex)
+
+par(mar=c(5, 4, 4, 8), xpd=TRUE, cex = 1)
+plot( trackcells$ET, main = "ET", lwd=1, cex=0.25, pch.start = 1, pch.end = NULL, pch=19,
+      col=alpha(as.factor(1:length(trackcells$ET)),0.7) ) 
+par(cex = 0.5)
+legend("topright", inset=c(-0.2,0), legend=names(trackcells$ET), pch=19, col=as.factor(1:length(trackcells$ET)))
+
+par(mar=old_par$mar, xpd=old_par$xpd, cex=old_par$cex)
+
+```
+
+
+\
+
+## 3D track visualization
+
+
+### Complete tracks
+
+```{r, fig.asp=1}
+plot3d( trackcells$CM, main = "CM", tick.marks = FALSE,)
+plot3d( trackcells$ET, main = "ET", tick.marks = FALSE) 
+```
+
+\
+
+
+Plotting the tracks with the same coordinate system:
+
+```{r, fig.asp=1}
+plot3d( trackcells$CM, main = "CM", tick.marks = FALSE,xlim = c(floor(min(tcells_final2$X)),ceiling(max(tcells_final2$X))),
+                    ylim = c(floor(min(tcells_final2$Y)),ceiling(max(tcells_final2$Y))),
+                    zlim = c(floor(min(tcells_final2$Z)),ceiling(max(tcells_final2$Z)))
+)
+plot3d( trackcells$ET, main = "ET", tick.marks = FALSE,xlim = c(floor(min(tcells_final2$X)),ceiling(max(tcells_final2$X))),
+                     ylim = c(floor(min(tcells_final2$Y)),ceiling(max(tcells_final2$Y))),
+                     zlim = c(floor(min(tcells_final2$Z)),ceiling(max(tcells_final2$Z)))
+)
+```
+
+\
+
+### Initial and final positions
+
+```{r, fig.asp=1}
+
+plot3d( lapply(trackcells$CM, FUN= function(x) x[c(1:2,(max(dim(x)[1])-1):(max(dim(x)[1]))),]), main = "CM", tick.marks = FALSE,)
+plot3d( lapply(trackcells$ET, FUN= function(x) x[c(1:2,(max(dim(x)[1])-1):(max(dim(x)[1]))),]), main = "ET", tick.marks = FALSE,)
+```
+
+\
+
+
+Plotting the tracks with the same coordinate system:
+
+```{r, fig.asp=1}
+
+plot3d( lapply(trackcells$CM, FUN= function(x) x[c(1:2,(max(dim(x)[1])-1):(max(dim(x)[1]))),]), 
+        main = "CM", tick.marks = FALSE,
+        xlim = c(floor(min(tcells_final2$X)),ceiling(max(tcells_final2$X))),
+        ylim = c(floor(min(tcells_final2$Y)),ceiling(max(tcells_final2$Y))),
+        zlim = c(floor(min(tcells_final2$Z)),ceiling(max(tcells_final2$Z)))
+        )
+plot3d( lapply(trackcells$ET, FUN= function(x) x[c(1:2,(max(dim(x)[1])-1):(max(dim(x)[1]))),]), 
+        main = "ET", tick.marks = FALSE,
+        xlim = c(floor(min(tcells_final2$X)),ceiling(max(tcells_final2$X))),
+        ylim = c(floor(min(tcells_final2$Y)),ceiling(max(tcells_final2$Y))),
+        zlim = c(floor(min(tcells_final2$Z)),ceiling(max(tcells_final2$Z)))
+        )
+```
+
+\
+
+
+# Tracking Analysis
+
+
+```{r}
+all_measures_instant <- c("speed",
+                  "displacement",
+                  "squareDisplacement",
+                  "displacementRatio",
+                  "outreachRatio",
+                  "straightness",
+                  "asphericity",
+                  "overallAngle",
+                  "meanTurningAngle",
+                  "overallDot",
+                  "overallNormDot",
+                  "fractalDimension"
+                  )
+
+all_measures_track <- c("trackLength",
+                        #"duration",
+                        "maxDisplacement",
+                        "hurstExponent"
+)
+
+other_measures <- c("displacementVector")
+```
+
+
+
+## Read converted tracks
+
+```{r}
+tcells_final3 <- read.csv(file.path(path_track, paste0(file_track,"_alltracks.csv")),row.names = 1)
+``` 
+
+### Solving problems
+
+There are some cells that has more than 1 coordinate in the same timepoint!!!
+
+
+```{r}
+idx_dup <- which(duplicated(tcells_final3[,c("node_id","timepoint")]) | 
+                   duplicated(tcells_final3[,c("node_id","timepoint")], fromLast = TRUE))
+tcells_final3_dup <- tcells_final3[idx_dup,]
+```
+
+```{r}
+knitr::kable(tcells_final3_dup, 
+              caption = "Cells with inconsistent information",
+              row.names = T,
+              digits = 100,
+              booktabs = TRUE, 
+              longtable = TRUE) %>%
+       kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                     fixed_thead = TRUE,
+                     bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                     position = "center") %>%
+   kableExtra::scroll_box(height = "400px")
+```
+
+\
+
+We are correcting this temporarily by keeping the first element
+
+```{r}
+tcells_final4 <- tcells_final3[!duplicated(tcells_final3[,c("node_id","timepoint")]),]
+rownames(tcells_final4) <- NULL
+```
+
+
+```{r}
+knitr::kable(head(tcells_final4,500), 
+             caption = paste0("All corrected tracks [",
+                              nrow(tcells_final4),
+                              " x ",
+                              ncol(tcells_final4),
+                              "] (first 500 rows)"
+             ),
+              digits = 100,
+              row.names = TRUE,
+              booktabs = TRUE, 
+              longtable = TRUE) %>%
+       kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                     fixed_thead = TRUE,
+                     bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                     position = "center") %>%
+   kableExtra::scroll_box(height = "400px")
+```
+
+
+
+```{r}
+
+cellpops <- unique(tcells_final4$cell_type)
+
+trackcellsOK <- lapply(unique(tcells_final4$cell_type), FUN = function(x){
+  as.tracks(tcells_final4[tcells_final4$cell_type==x,]
+            ,id.column = 1
+            ,time.column = 7
+            ,pos.columns = 3:5)
+})
+names(trackcellsOK) <- unique(tcells_final4$cell_type)
+
+```
+
+```{r}
+trackcells_sub <- trackcellsOK
+```
+
+\
+
+## Compute measurements using different temporal windows
+
+Temporal windows:
+
+* Define all subtracks of size w (number of timepoints or steps) for each cell
+* Compute all measurements for all those subtracks
+* Assign output values for the subtrack of cell X using a row in the table, determined by:
+    * node_id: Cell X
+    * timepoint: starting point of the subtrack
+    * window: w, the length of the subtrack
+    
+Measurements for each subtrack:
+
+* **trackLength**: sums up the distances between subsequent positions; in other words, it estimates the length of the underlying subtrack by linear interpolation (usually an underestimation)
+* **duration**: time elapsed between first and last positions of the subtrack
+* **maxDisplacement**: maximal Euclidean distance of any position on the subtrack from the first position
+* **speed**: trackLength/duration
+* **displacement**: Euclidean distance between the track starting and endpoints
+* **squareDisplacement**: squared Euclidean distance between the track starting and endpoints
+* **displacementRatio**: displacement/maxDisplacement (values between 0 and 1, where 1 means a perfectly straight track)
+* **outreachRatio**: maxDisplacement/trackLength (values between 0 and 1, where 1 means a perfectly straight track)
+* **straightness**: displacement/trackLength (values between 0 and 1, where 1 means a perfectly straight track)
+* **asphericity**: a different appraoch to measure straightness, that computes the asphericity of the set of positions on the subtrack _via_ the length of its principal components (number between 0 and 1, with higher values indicating straighter tracks). Unlike straightness, however, asphericity ignores back-and-forth motion of the object, so something that bounces between two positions will have low straightness but high asphericity. We define the asphericity of every track with two or fewer positions to be 1.
+* **overallAngle**: angle (degrees) between the first and the last segment of the given track. Angles are measured symmetrically, thus the return values range from 0 to pi; for instance, both a 90 degrees left and right turns yield the same value pi/2 radians.
+* **meanTurningAngle**: averages the overallAngle over all adjacent segments of a given track; a low meanTurningAngle indicates high persistence of orientation, whereas for an uncorrelated random walk we expect 90 degrees. Note that angle measurements will yield NA values for tracks in which two subsequent positions are identical.
+* **overallDot**: computes the dot product between the first and the last segment of the given track.
+* **overallNormDot**: computes the dot product between the unit vectors along the first and the last segment of the given track. These two functions may be useful to generate autocovariance plots.
+* **fractalDimension**: fractal dimension is a mathematical concept used to describe the complexity of self-similar patterns or structures, such as fractals. It is a measure of how much detail or irregularity is present in a pattern or structure. This function estimates the fractal dimension of a track using the function fd.estim.boxcount, which involves dividing the cell trajectories into smaller and smaller boxes of a given size, counting the number of boxes that contain part of the trajectory, and then using this information to estimate the fractal dimension. In general, a higher fractal dimension can indicate that the cell track is more complex or irregular, and may be more invasive or aggressive. Conversely, a lower fractal dimension may indicate a more regular or uniform track shape, and may be associated with less invasive or aggressive behavior.
+
+NOTE: With increasing window sizes, the number of available timepoints per cell decrease, since we can not create subtracks of length w starting in the last w timepoints.
+
+\
+
+```{r}
+multiple.func2 <- function(x) {
+      c(trackLength = trackLength(x), 
+        #duration = duration(x), 
+        maxDisplacement = maxDisplacement(x),
+        speed = speed(x),
+        displacement = displacement(x),
+        squareDisplacement = squareDisplacement(x),
+        displacementRatio = displacementRatio(x),
+        outreachRatio = outreachRatio(x),
+        straightness = straightness(x),
+        asphericity = asphericity(x),
+        overallAngle = pracma::rad2deg(overallAngle(x)),
+        meanTurningAngle = pracma::rad2deg(meanTurningAngle(x)),
+        overallDot = overallDot(x),
+        overallNormDot = overallNormDot(x),
+        fractalDimension = fractalDimension(x)
+        )
+}
+```
+
+
+```{r}
+
+if (file.exists(file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT.csv")))){
+  final_table_timepoints_TOT <- read.csv(file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT.csv")))
+}else{
+    
+  windows <- c(1,5,10,15,20,25,30,35,40,45,50,60,70,80,90,100)
+  
+  final_table_timepoints <- list()
+  for (w in windows){
+    print(paste0("Computing window = ", w))
+    kk <- sapply(subtracks(trackcells_sub$CM,w), multiple.func2)
+    kkt <- as.data.frame(t(kk)) %>% tibble::rownames_to_column("kk") %>% tidyr::separate(kk, c("node_id","t"))
+    realt <- unlist(lapply(trackcells_sub$CM, FUN = function(x) if (dim(x)[1]>w) x[1:(dim(x)[1]-w),"t"]))
+    kkt$timepoint <- realt
+    kkt$cell_type <- "CM"
+    kkt$window <- w
+    kkt <- kkt %>% dplyr::select(window, cell_type, node_id, timepoint, t, everything())
+    final_table_timepoints <- rbind(final_table_timepoints,kkt)
+    
+    # ET
+    kk <- sapply(subtracks(trackcells_sub$ET,w), multiple.func2)
+    kkt2 <- as.data.frame(t(kk)) %>% tibble::rownames_to_column("kk") %>% tidyr::separate(kk, c("node_id","t"))
+    realt <- unlist(lapply(trackcells_sub$ET, FUN = function(x) if (dim(x)[1]>w) x[1:(dim(x)[1]-w),"t"]))
+    kkt2$timepoint <- realt
+    kkt2$cell_type <- "ET"
+    kkt2$window <- w
+    kkt2 <- kkt2 %>% dplyr::select(window, cell_type, node_id, timepoint, t, everything())
+    final_table_timepoints <- rbind(final_table_timepoints,kkt2)
+  }
+  
+  final_table_timepoints2 <- list()
+  for (w in windows){
+    a <- tcells_final4 %>% group_by(cell_type,node_id) %>% arrange(node_id,timepoint) %>% filter(n()>=w) %>% mutate(window=w,DistBorderMean = c(zoo::rollmean(DistBorder,w), rep(NA,w-1)))
+    a <- a[!is.na(a$DistBorderMean),c("window","node_id","cell_type","timepoint","DistBorderMean")]
+    final_table_timepoints2 <- rbind(final_table_timepoints2,a)
+  }
+  
+  final_table_timepoints_TOT <- merge(final_table_timepoints, final_table_timepoints2)
+  
+  write.csv(final_table_timepoints_TOT,
+            row.names = FALSE,
+            file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT.csv")))
+}
+
+```
+
+
+```{r}
+knitr::kable(head(final_table_timepoints_TOT,500), 
+             caption = paste0("Track Measurements using different windows [",
+                              nrow(final_table_timepoints_TOT),
+                              " x ",
+                              ncol(final_table_timepoints_TOT),
+                              "] (first 500 rows)"
+             ),
+              digits = 100,
+              row.names = TRUE,
+              booktabs = TRUE, 
+              longtable = TRUE) %>%
+       kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                     fixed_thead = TRUE,
+                     bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                     position = "center") %>%
+   kableExtra::scroll_box(height = "400px")
+```
+
+\
+
+```{r}
+final_table_timepoints_TOT2 <- read.csv(file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT.csv")))
+```
+
+
+## Plots by celltype (CM/ET)
+
+```{r, fig.asp=2.5}
+vars2plot <- colnames(final_table_timepoints_TOT2)[-c(1:5)]
+
+for (vars2plot_i in vars2plot){
+  kkmean <- final_table_timepoints_TOT2 %>% group_by(cell_type, timepoint, window) %>% summarise_at(vars2plot_i, mean)
+  h <- ggplot(final_table_timepoints_TOT2, aes(x=timepoint, color=cell_type)) + 
+    geom_line(aes_string(y=vars2plot_i, group="node_id"), alpha=0.3) +
+    geom_line(data = kkmean, aes_string(y=vars2plot_i), size=2) +
+    facet_wrap(~ window, ncol=2,scales = "free_y") + 
+    theme(legend.position="top")
+  print(h)
+}
+```
+
+
+\
+
+## Generate table by cell-timepoint
+
+Each measure using different window sizes will be different features (wide data).
+
+\
+
+```{r}
+
+if (file.exists(file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide.csv")))){
+  final_table_timepoints_TOT_wide <- read.csv(file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide.csv")))
+}else{
+  final_table_timepoints_TOT_wide <- final_table_timepoints_TOT2 %>% arrange(window,cell_type,node_id,timepoint) %>% tidyr::pivot_wider(names_from = "window", values_from = !c(window, cell_type, node_id, timepoint, t),names_prefix = paste0("win"))
+  
+  write.csv(final_table_timepoints_TOT_wide,
+            row.names = FALSE,
+            file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide.csv")))
+}
+
+
+```
+
+
+
+```{r}
+knitr::kable(head(final_table_timepoints_TOT_wide,200), 
+             caption = paste0("Cell-timepoints Track-based Measurements using different windows [",
+                              nrow(final_table_timepoints_TOT_wide),
+                              " x ",
+                              ncol(final_table_timepoints_TOT_wide),
+                              "] (first 200 rows)"
+             ),
+              digits = 100,
+              row.names = TRUE,
+              booktabs = TRUE, 
+              longtable = TRUE) %>%
+       kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                     fixed_thead = TRUE,
+                     bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                     position = "center") %>%
+   kableExtra::scroll_box(height = "400px")
+```
+
+
+\
+
+
+
+# Statistical Analysis of longitudinal data
+
+We created a statistical model that takes into account longitudinal variables (same parameters measured at different times) and samples (measurements coming from the same cell).
+
+We used linear mixed-effects models for analysis of numerical temporal variables. lmer allow us to model the response variable in terms of time, cell type, and their interaction, including also random effects for longitudinal data.
+
+\
+
+## Non-linear Univariate Analysis of Numerical Longitudinal Data
+
+We have numerical longitudinal parameters: repeated measurements of a response variable (Y) over time (t) for multiple individuals (id).
+
+We want to test whether there is a difference in the average response over time between two cell types (CM vs ET).We use lmer to create a model that includes a fixed effect for cell_type, a fixed effect for timepoint, and their interaction, as well as (uncorrelated) random intercepts and slopes for time nested within each individual (node_id).
+
+We can observe in the plots representing mean curves of parameters in time, that the longitudinal variables are not changing linearly in time. For that reason, we decided to include natural cubic splines to model the potential non-linearities. Each spline captures a different segment/interval of the relationship between 'timepoint' and the outcome variable. We use splines with N degrees of freedom, dividing the temporal effect in N time slots, where we can test if the parameter is changing more or less between groups. The number of degrees of freedom determines the level of flexibility in the spline function. A higher number of degrees of freedom allows for more flexibility and can capture more complex patterns in the data. However, a larger number of degrees of freedom may also increase the risk of overfitting, especially when the sample size is limited. 
+
+Interpretation of model coefficients:
+
+- The coefficient for group will represent the difference in the average response between the cell_type ET and the reference one (CM) at time zero (i.e., the intercept).
+
+- For the natural cubic splines of age, there are N estimates, with the spline basis functions allowing for a non-linear relationship between timepoint and the response. The estimates/coefficients represent the expected change in the response variable per unit change in timepoint for each of the N splines, not taking into account the existence of different groups (cell_types). For instance 'ns(timepoint, 4)1' (it uses 4 splines to model 4 timeslots) will represent the change (positive=increase, negative=reduction) of the parameter in the first 25% of temporal window; 'ns(timepoint, 4)2' in the 2nd (25%-50%), and so on.
+
+- The interaction terms between cell_type and timepoint tests whether the change in the response over time differs between  two groups/cell_types (ET vs CM). For example, the coefficient for 'cell_typeET:ns(age, 4)1' represents the estimated difference in the rate of change of the response variable between cell_type=ET and the reference cell_type (CM) in the first temporal slot (1st 1/4). A positive/negative coefficient indicates that the response variable changes at a higher/slower rate in the cell_type=ET.
+
+
+The p-values associated with the coefficients indicate whether the estimated effects are statistically significant or not. A small p-value (typically below a certain significance level, e.g., 0.05) suggests that the associated coefficient is unlikely to be zero, indicating a significant effect. Conversely, a large p-value suggests that the associated coefficient may not be significantly different from zero.
+
+
+
+\
+
+
+```{r}
+numsplines <- 5
+```
+
+
+
+```{r include=FALSE}
+source('LinearMixModel_UnivDJC_nowarn_v2.R')
+all.reslmm <- LinearMixModel_UnivDJC_nowarn_v2(data = dt.ord2,
+                               time.var = "timepoint",
+                               effect.var = "cell_type",
+                               id.var = "node_id",
+                               long.vars = long.vars,
+                               log.cont.vars = FALSE,
+                               norm.cont.vars = TRUE,
+                               cov.vars = NULL,
+                               cov.vars.interaction = "+", 
+                               param.cov.vars.interaction = "+",
+                               rem.vars = NULL,
+                               ns.time.var = numsplines, # df of splines use for time
+                               # subset.var = NULL,
+                               # subset.value = NULL,
+                               out.path = path_track
+                               )
+
+all.reslmm$pval.adj <- p.adjust(all.reslmm$pval,method = "holm")
+
+write.csv(all.reslmm, 
+        row.names = FALSE,
+        file.path(path_track,paste0("stat_lmer_ns",numsplines,".csv")))
+```
+
+```{r}
+
+
+all.reslmm2 <- all.reslmm %>% 
+  mutate_if(
+    is.numeric, 
+    function(x) {
+      if_else(
+        x > 50000 | x < 0.05,
+        formatC(x, digits = 2, format = "e", drop0trailing = TRUE),
+        formatC(x, digits = 2, format = "f", drop0trailing = TRUE)
+      )
+    }
+  )
+
+
+knitr::kable(all.reslmm2,#format_engr(all.reslmm, sigdig = 2, ambig_0_adj = TRUE),
+             caption = "Results",
+             digits = 3,
+             format = "html",
+             row.names = F,
+             booktabs = TRUE, 
+             longtable = TRUE) %>%
+      kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                    fixed_thead = TRUE,
+                    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                    position = "center") %>%
+  kableExtra::scroll_box(height = "400px")
+
+
+```
+
+\
+
+### Print Pvalues and Coefs
+
+Color represent coefficients, and significance levels (from adjusted p-values) are depicted in each cell: \*<0.05, \*\*<0.01. \*\*\*<0.001.
+
+\
+
+```{r, fig.asp=5, fig.width=4}
+df <- all.reslmm
+df$Param2 <- paste(df$Param, df$Effect, sep='.')
+rownames(df) <- df$Param2
+
+df_sig <- df[complete.cases(df), ]
+
+df_sig$signif_code <- ifelse(df_sig$pval.adj < 0.001, "***",
+                             ifelse(df_sig$pval.adj < 0.01, "**",
+                                    ifelse(df_sig$pval.adj < 0.05, "*", " ")))
+
+df_sig_split <- df_sig %>% group_split(Effect)
+
+df_sig2 <- df_sig_split[[1]][,"Param",drop=FALSE]
+for (df_sigaux in df_sig_split){
+  df_sigaux <- df_sigaux %>% as.data.frame() %>% column_to_rownames("Param")
+  df_sigaux <- df_sigaux[,c("Coef","Effect","signif_code"),drop=FALSE]
+  colnames(df_sigaux) <- paste(colnames(df_sigaux),unique(df_sigaux$Effect), sep=".")
+  df_sig2 <- cbind(df_sig2,df_sigaux)
+}
+
+col_fun <- circlize::colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+# Create heatmap
+ht_map <- Heatmap(
+  as.matrix(df_sig2[,startsWith(colnames(df_sig2),"Coef"),drop=FALSE]),
+  name = paste0("Coefs", " - ",unique(df_sig2$Effect)),
+  col = col_fun,
+  row_names_gp = gpar(fontsize = 8),
+  column_names_gp = gpar(fontsize = 10),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(df_sig2[i,gsub("Coef",
+                             "signif_code",
+                             colnames(df_sig2)[startsWith(colnames(df_sig2),"Coef")][j])], 
+              x = x, y = y, gp = gpar(fontsize = 10, col = "black"))
+  },
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_column_names = TRUE,
+  show_row_names = TRUE,
+  row_dend_reorder = FALSE,
+  column_dend_reorder = FALSE,
+  column_title = "Parameters"
+)
+
+draw(ht_map)
+
+```
+
+
+
+# Explore ouput (wide) data [ALL WINDOWS (BUT LATER KEEP LESS OR EQ THAN 40)]
+
+
+```{r}
+knitr::kable(head(final_table_timepoints_TOT_wide,200), 
+             caption = paste0("Cell-timepoints Track-based Measurements using different windows [",
+                              nrow(final_table_timepoints_TOT_wide),
+                              " x ",
+                              ncol(final_table_timepoints_TOT_wide),
+                              "] (first 200 rows)"
+             ),
+              digits = 100,
+              row.names = TRUE,
+              booktabs = TRUE, 
+              longtable = TRUE) %>%
+       kableExtra::kable_styling(latex_options = c("hold_position","repeat_header"),
+                     fixed_thead = TRUE,
+                     bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+                     position = "center") %>%
+   kableExtra::scroll_box(height = "400px")
+```
+
+
+\
+
+```{r}
+df <- final_table_timepoints_TOT_wide
+
+df_desc <- introduce(df)
+```
+
+```{r}
+knitr::kable(as.matrix(t(df_desc)), caption = "Description of full dataset") %>%
+      kableExtra::kable_styling(latex_options = c("hold_position"),bootstrap_options = "striped",full_width = FALSE, position = "center")
+```
+
+
+```{r, fig.asp=0.4}
+plot_intro(df)
+```
+
+
+\
+
+```{r fig.asp=4}
+plot_missing(df, 
+             geom_label_args = list(size = 2.5, 
+                                    label.padding = unit(0.01, "lines"),
+                                    hjust = -0.1,
+                                    label.size = 0))
+```
+
+
+\
+
+## Clean 
+
+### Remove columns that are all NaN
+
+```{r}
+
+# Remove all nans
+df2 <- df[,colSums(is.na(df))<nrow(df)]
+plot_intro(df2)
+
+```
+
+\
+
+
+### Remove all columns with more that 16% of Nans (windows>40)
+
+```{r fig.asp=4}
+df3 <- df2[,colSums(is.na(df2))<0.16*nrow(df2)]
+
+df3 <- df3[complete.cases(df3),]
+```
+
+
+```{r fig.asp=4}
+knitr::kable(as.matrix(t(introduce(df3))), caption = "Description of full dataset") %>%
+      kableExtra::kable_styling(latex_options = c("hold_position"),bootstrap_options = "striped",full_width = FALSE, position = "center")
+
+
+```
+
+\
+
+```{r}
+write.csv(df3,
+            row.names = FALSE,
+            file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide_clean.csv")))
+```
+
+
+\
+
+## Unsupervised Analysis
+
+Dimensionality reduction (linear: PCA, and non-linear: tSNE and UMAP) and clustering for visual inspection of tracking data and cells. 
+
+
+
+```{r selcolors}
+
+colors_samples = scales::hue_pal()(2)
+colors_clusters = c(RColorBrewer::brewer.pal(12,name = "Paired"),
+                      DiscretePalette(32, 
+                               palette = "glasbey")[-4],
+                    RColorBrewer::brewer.pal(9,name = "Set1"),
+                    RColorBrewer::brewer.pal(8,name = "Set2"),
+                    RColorBrewer::brewer.pal(12,name = "Set3"),
+                    RColorBrewer::brewer.pal(9,name = "Pastel1"),
+                    RColorBrewer::brewer.pal(8,name = "Pastel2"),
+                    RColorBrewer::brewer.pal(8,name = "Accent"),
+                    RColorBrewer::brewer.pal(8,name = "Dark2")
+                    )
+color_expression = pals::jet(n = 50)
+
+```
+
+\
+
+### Remove duplicated rows
+
+We remove duplicated rows if they exist, since they create problems in downstream steps. 
+
+```{r}
+kkdf <- df3
+idx_dup <- which(duplicated(kkdf[,3:length(colnames(kkdf))]) | 
+                   duplicated(kkdf[,3:length(colnames(kkdf))], fromLast = TRUE))
+kk <- df3[idx_dup,]
+
+kk2 <- kk %>% group_by_at(vars(!node_id)) %>% summarise_at(.vars = "node_id",.funs = sum) %>% ungroup()
+
+```
+
+```{r}
+if (file.exists(file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide_clean_nodups.csv")))){
+  df4 <- read.csv(file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide_clean_nodups.csv")))
+}else{
+    
+  df4 <- rbind(df3[-idx_dup,],kk2)
+  
+  varscat <- colnames(df4)[1:4]
+  varsnum <- colnames(df4)[5:length(colnames(df4))]
+  varsanal <- varsnum
+  
+  for (col in varscat){
+    df4[[col]] <- as.factor(df4[[col]])
+  }
+  
+  write.csv(df4,
+          row.names = FALSE,
+          file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide_clean_nodups.csv")))
+}
+
+```
+
+
+
+
+```{r}
+
+
+if (file.exists(file.path(path_track, paste0(file_track,"_SO.rds")))){
+  SO <- readRDS(file.path(path_track, paste0(file_track,"_SO.rds")))
+}else{
+  data2load <- t(df4)
+  colnames(data2load) <- rownames(df4)
+  
+  # Add coordinates X Y Z, Dists, and more
+  df4_cat <- merge(df4[,varscat,drop=FALSE], tcells_final4, all.x=T, all.y = F)
+  
+  SO <- CreateSeuratObject(data2load[varsnum,], 
+                              assay="IM", 
+                              meta.data = df4_cat,
+                              project = "Tracking",
+                              features=varsnum
+  )
+  VariableFeatures(SO) <- varsanal
+  SO <- SO %>% ScaleData() %>% RunPCA()
+  saveRDS(SO, file.path(path_track, paste0(file_track,"_SO.rds"))) 
+}
+```
+
+
+\
+
+### PCA
+
+Select the number of PCAs to use for subsequent analyses, using automated elbow point detection algorithm.
+
+\
+
+```{r}
+std_pc <- Stdev(SO, reduction = "pca")
+eigs <- std_pc^2
+eigs2 <- eigs - min(eigs)
+propimportancepcs <- eigs2/sum(eigs2) 
+cumpropimportancepcs <- cumsum(eigs2)/sum(eigs2)
+elbpoint <- kneedle::kneedle(1:length(std_pc), std_pc)
+
+pcas <- 1:elbpoint[1]
+
+```
+
+```{r}
+ggplot(data.frame(PC=1:length(std_pc),STD=std_pc), aes(x=PC,y=STD)) + 
+  geom_point() +
+  geom_vline(xintercept=elbpoint[1], colour='red') + 
+  ggtitle(paste0("ElbowPoint = ", elbpoint[1]))
+
+```
+
+
+```{r}
+useAssay <- "IM"
+pcas <- 1:elbpoint[1]
+```
+
+
+\
+
+### Clustering
+
+Clusters are identified using nearest neighbors algorithm at different resolutions with louvain algorithm.
+
+\
+
+```{r}
+ress <- c(0.1,0.2,0.5,0.75)
+clusteringnames <- paste0(useAssay, "_snn_res.",ress)
+  
+if (file.exists(file.path(path_track, paste0(file_track,"_SO2.rds")))){
+  SO <- readRDS(file.path(path_track, paste0(file_track,"_SO2.rds")))
+}else{
+  
+  SO <- FindNeighbors(SO, dims = pcas, reduction = "pca")
+  
+  
+  SO <- FindClusters(SO, resolution = ress, verbose = F)
+    
+    # Convert to factors
+  for (clusteringname in clusteringnames){
+    SO[[clusteringname]] <- 
+      as.factor(paste0("C", str_pad(SO[[clusteringname]][,1], 2, pad = "0")))
+  }
+  
+  saveRDS(SO, file.path(path_track, paste0(file_track,"_SO2.rds"))) 
+}
+```
+
+
+```{r}
+
+t <- SO@meta.data[,clusteringnames] %>% pivot_longer(cols = everything(),names_to = "res", values_to = "cluster") %>% group_by(cluster) %>% table
+
+knitr::kable(t, caption = "Number of clusters and cells for each clustering resolution") %>%
+    kableExtra::kable_styling(latex_options = c("hold_position"),position = "center")
+
+```
+
+\
+
+### Dimensionality Reduction
+
+
+
+```{r}
+
+selres <- 0.2
+res <- paste0(useAssay, "_snn_res.",selres)
+
+SO <- SetIdent(SO,value = res)
+
+```
+
+The clustering defined by resolution of `r res` was used in this initial tSNE/UMAP setup.
+
+\
+
+#### tSNE
+
+Parameters to adjust: perplexity.
+
+```{r}
+
+DefaultAssay(SO) <- useAssay
+
+seed <- 123456
+val <- res
+
+perpList <- c(30, 50, 100,200)
+
+if (file.exists(file.path(path_track, paste0(file_track,"_SO3_tsne.rds")))) {
+ 
+  SO <- readRDS(file = file.path(path_track, paste0(file_track,"_SO3_tsne.rds")))
+ 
+} else {
+ 
+  for (perpl in perpList) {
+    
+      print(paste("Compute tSNE from perplexity:",perpl))
+      
+      SO <- RunTSNE(SO
+                          , assay = useAssay
+                          , seed.use = seed
+                          , dims = pcas
+                          , perplexity = perpl
+                          , check_duplicates = FALSE
+                          , reduction.name = paste0("tSNE.",perpl)
+                          , reduction.key = paste0("tSNE",perpl,"_")
+                          , verbose = F
+      )
+      
+  }
+ 
+  saveRDS(SO,file = file.path(path_track, paste0(file_track,"_SO3_tsne.rds"))) 
+ 
+}
+
+```
+
+
+```{r, fig.asp=2}
+pList <- list()
+tSneDf <- NULL
+for (perpl in perpList) {
+  ce <- as.data.frame(Embeddings(SO,reduction = paste("tSNE",perpl,sep=".")))
+  colnames(ce) <- c("tSNE_1","tSNE_2")
+  ce$Perplexity <- as.character(perpl)
+  ce$CellNames <- rownames(ce)
+  ce$Cluster <- SO@meta.data[ce$CellNames,res]
+  ce$cell_type <- SO@meta.data[ce$CellNames,"cell_type"]
+  rownames(ce) <- NULL
+  if (is.null(tSneDf)) {
+    tSneDf <- ce
+  } else {
+    tSneDf <- rbind(tSneDf,ce)
+  }
+}
+tSneDf$Perplexity <- factor(tSneDf$Perplexity,levels = unique(gtools::mixedsort(tSneDf$Perplexity)))
+
+pList[[length(pList)+1]] <- ggplot(tSneDf,aes(x=tSNE_1,y=tSNE_2,colour=Cluster)) +
+  geom_point(size=0.5) +
+  facet_wrap("Perplexity",scales = "free") +
+  ggtitle("Perplexity Setup") +
+  scale_color_manual(values = colors_clusters) +
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  theme(
+    aspect.ratio = 1
+    , legend.position = "bottom"
+    , legend.direction = "horizontal"
+    , legend.key = element_rect(fill = "white")
+    , panel.background = element_rect(fill = "white", colour = "black")
+    )
+
+pList[[length(pList)+1]] <- ggplot(tSneDf,aes(x=tSNE_1,y=tSNE_2,colour=cell_type)) +
+  geom_point(size=0.5) +
+  facet_wrap("Perplexity",scales = "free") +
+  ggtitle("Perplexity Setup") +
+  scale_color_manual(values = colors_samples) +
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  theme(
+    aspect.ratio = 1
+    , legend.position = "bottom"
+    , legend.direction = "horizontal"
+    , legend.key = element_rect(fill = "white")
+    , panel.background = element_rect(fill = "white", colour = "black")
+    )
+
+do.call("grid.arrange", c(pList, ncol=1,top="tSNE Parameters")) 
+
+
+
+```
+*tSNE maps obtained for different values of perplexity parameter, and colored by the clusters obtained with the initial selection of resolution (top) and by cell_type (bottom)*
+
+\
+
+```{r}
+
+perpl <- 200
+seltsne <- paste("tSNE",perpl,sep=".")
+rs <- "123456"
+
+```
+
+
+All results are very similar, so we decided to use perplexity = `r perpl` for the rest of the analysis.
+
+\
+
+#### UMAP
+
+Parameters to adjust: nearest neighbors (N Neighs) and min distance (Min Dist).
+
+```{r}
+
+DefaultAssay(SO) <- useAssay
+
+seed <- 123456
+
+n.neighbors.pos <- c(15, 30, 50, 100)
+min.dist.pos <- c(0.1,0.3,0.5,1)
+
+if (file.exists(file.path(path_track, paste0(file_track,"_SO3_umap.rds")))) {
+ 
+  SO <- readRDS(file = file.path(path_track, paste0(file_track,"_SO3_umap.rds")))
+ 
+} else {
+  
+  for (n in n.neighbors.pos){
+    for (d in min.dist.pos){
+      SO <- RunUMAP(SO,
+                       n.neighbors = n,
+                       min.dist = d,
+                       seed.use = seed,
+                       dims = pcas,
+                       reduction.name = paste("UMAP","Neigh",n,"MinD",d,sep="."),
+                       reduction.key = paste0(paste("UMAP","Neigh",n,"MinD",d,sep="."),"_"),
+                       verbose = F)
+    }
+  }
+  
+  saveRDS(SO,file = file.path(path_track, paste0(file_track,"_SO3_umap.rds")))
+  
+}
+
+
+```
+
+
+```{r, fig.asp=2, fig.width=10}
+
+umapDf <- NULL
+for (n in n.neighbors.pos){
+  for (d in min.dist.pos){
+    ce <- as.data.frame(Embeddings(SO,reduction = paste("UMAP","Neigh",n,"MinD",d,sep=".")))
+    colnames(ce) <- c("UMAP_1","UMAP_2")
+    ce$Neigh <- as.character(n)
+    ce$MinD <- as.character(d)
+    ce$CellNames <- rownames(ce)
+    ce$Cluster <- SO@meta.data[ce$CellNames,res]
+    ce$cell_type <- SO@meta.data[ce$CellNames,"cell_type"]
+    rownames(ce) <- NULL
+    if (is.null(umapDf)) {
+      umapDf <- ce
+    } else {
+      umapDf <- rbind(umapDf,ce)
+    }
+  }
+}
+umapDf$Neigh <- factor(umapDf$Neigh,levels = unique(gtools::mixedsort(umapDf$Neigh)))
+umapDf$MinD <- factor(umapDf$MinD,levels = unique(gtools::mixedsort(umapDf$MinD)))
+
+pList <- list()
+
+pList[[length(pList)+1]] <- ggplot(umapDf,aes(x=UMAP_1,y=UMAP_2,colour=Cluster)) +
+  geom_point(size=0.5) +
+  facet_wrap(c("Neigh","MinD"),scales = "free") +
+  ggtitle("N Neighs and Min Dist Setup") +
+  scale_color_manual(values = colors_clusters) +
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  theme(
+    aspect.ratio = 1
+    , legend.position = "bottom"
+    , legend.direction = "horizontal"
+    , legend.key = element_rect(fill = "white")
+    , panel.background = element_rect(fill = "white", colour = "black")
+    )
+
+pList[[length(pList)+1]] <- ggplot(umapDf,aes(x=UMAP_1,y=UMAP_2,colour=cell_type)) +
+  geom_point(size=0.5) +
+  facet_wrap(c("Neigh","MinD"),scales = "free") +
+  ggtitle("N Neighs and Min Dist Setup") +
+  scale_color_manual(values = colors_samples) +
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  theme(
+    aspect.ratio = 1
+    , legend.position = "bottom"
+    , legend.direction = "horizontal"
+    , legend.key = element_rect(fill = "white")
+    , panel.background = element_rect(fill = "white", colour = "black")
+    )
+
+
+
+do.call("grid.arrange", c(pList, ncol=1,top="UMAP Parameters")) 
+
+
+
+```
+*UMAPs obtained for different combination of values for N Neigh and Min Dist parameters, and colored by the clusters obtained with the initial selection of resolution (top) and by cell_type (bottom)*
+
+\
+
+
+```{r}
+
+n <- 50
+d <- 0.3
+selumap <- paste("UMAP","Neigh",n,"MinD",d,sep=".")
+rs <- "123456"
+
+```
+
+
+All results are quite similar, so we decided to use N Neigh = `r n` and Min Dist = `r d` for the rest of the analysis.
+
+\
+
+
+### Redefinition of clustering resolution
+
+Now that we have defined the tSNE/UMAP distribution of the cells we will display the clusters obtained at different resolutions to see if another resolution fits better.
+
+```{r, fig.asp=0.9, fig.width=10}
+
+dotSize = 0.5
+titleSize = 6
+axisSize = 6
+
+df <- Embeddings(SO,reduction = seltsne)
+colnames(df) <- c("tSNE_1","tSNE_2")
+df2 <- Embeddings(SO,reduction = selumap)
+colnames(df2) <- c("UMAP_1","UMAP_2")
+df <- cbind(cbind(df,df2),FetchData(SO,vars = clusteringnames))
+
+
+df <- df %>% pivot_longer(cols = starts_with(paste0(useAssay, "_snn_res")),names_to="resolution", values_to="cluster")
+
+pList <- list()
+
+pList[[length(pList)+1]] <- ggplot(df,aes(x=tSNE_1,y=tSNE_2)) +
+  geom_point(aes(color = cluster), size = dotSize) +
+  scale_color_manual(values = c(colors_clusters,colors_clusters)) +
+  facet_wrap("resolution",ncol = length(clusteringnames)) +
+  theme(panel.grid = element_blank()
+        ,aspect.ratio = 1
+        , legend.position = "none"
+        , axis.title = element_text(size = axisSize)
+        , panel.background = element_blank()
+        , title = element_text(size = titleSize))
+
+pList[[length(pList)+1]] <- ggplot(df,aes(x=UMAP_1,y=UMAP_2)) +
+  geom_point(aes(color = cluster), size = dotSize) +
+  scale_color_manual(values = c(colors_clusters,colors_clusters)) +
+  facet_wrap("resolution",ncol = length(clusteringnames)) +
+  theme(panel.grid = element_blank()
+        ,aspect.ratio = 1
+        , legend.position = "bottom"
+        , legend.direction = "horizontal"
+        , axis.title = element_text(size = axisSize)
+        , panel.background = element_blank()
+        , title = element_text(size = titleSize)) +
+  guides(color = guide_legend(override.aes = list(size = 3)))
+
+
+do.call("grid.arrange", c(pList, ncol=1,top="Clustering Resolutions"))
+
+```
+*tSNE (top) and UMAP (bottom) maps colored by the clusters obtained at different resolutions*
+
+\
+
+```{r}
+res <- 0.5
+selresclus <- paste0(useAssay, "_snn_res.",res)
+```
+
+We decided to use clustering resolution `r res` ( clustering name: `r selresclus`). Results for them are in the next section.
+
+\
+
+
+
+### Final Results
+
+Displayed with tSNE and UMAP representations.
+
+```{r}
+
+
+if (file.exists(file.path(path_track, paste0(file_track,"_SO4_final.rds")))) {
+ 
+  SO <- readRDS(file = file.path(path_track, paste0(file_track,"_SO4_final.rds")))
+ 
+} else {
+  
+  SO <- SetIdent(SO, value = selresclus)
+  SO@meta.data$res.Final <- SO@meta.data[,selresclus]
+  SO@reductions$tSNE.Final <- SO@reductions[[seltsne]]
+  Key(SO@reductions$tSNE.Final) <- "tSNE_"
+  SO@reductions$UMAP.Final <- SO@reductions[[selumap]]
+  Key(SO@reductions$UMAP.Final) <- "UMAP_"
+  SO <- SetIdent(SO,value = "res.Final")
+  saveRDS(SO,file.path(path_track, paste0(file_track,"_SO4_final.rds")))
+
+}
+
+
+```
+
+\
+
+```{r}
+ntimepoints <- 5
+maxtimepoint <- max(as.numeric(SO$timepoint))
+time_step <- ceiling((maxtimepoint+1)/ntimepoints)
+
+SO2 <- SO
+SO2$node_id <- as.numeric(as.character(SO$node_id))
+SO2$node_id2 <- as.numeric(SO$node_id)
+SO2$ntimepoint <- as.numeric(as.character(SO$timepoint))
+SO2$intervalt <- cut(SO2$ntimepoint,ntimepoints)
+```
+
+
+#### Final Results Generic
+
+##### Proportions Celltype VS Cluster
+
+```{r}
+t.propCLUSTERbyCelltype <- 100*prop.table(table(SO2$cell_type,
+                                            SO2$res.Final),
+                                   margin = 1)
+
+h1 <- ggplot(as.data.frame(t.propCLUSTERbyCelltype),aes(x=Var1,y=Freq)) +
+  geom_bar(stat = "identity",aes(fill=Var2)) +
+  theme_bw() +
+  xlab("CellType") +
+  labs(fill="Cluster") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = colors_clusters) +
+  theme(legend.text=element_text(size=10),
+        axis.text = element_text(size=10),
+        legend.position = "bottom",
+        legend.key.size = unit(0.9, 'lines'))
+
+t.propCelltypebyCLUSTER <- 100*prop.table(table(SO2$res.Final,
+                                                SO2$cell_type),
+                                   margin = 1)
+
+h2 <- ggplot(as.data.frame(t.propCelltypebyCLUSTER),aes(x=Var1,y=Freq)) +
+  geom_bar(stat = "identity",aes(fill=Var2)) +
+  theme_bw() +
+  xlab("Cluster") +
+  labs(fill="CellType") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = colors_samples) +
+  theme(legend.text=element_text(size=10),
+        axis.text = element_text(size=10),
+        legend.position = "bottom",
+        legend.key.size = unit(0.9, 'lines'))
+
+h1 + h2
+```
+
+\
+
+##### Proportions Celltype VS Time 
+
+```{r, fig.width=10, fig.asp=0.5}
+t.propTimepointbyCelltype <- 100*prop.table(table(SO2$cell_type,
+                                            SO2$timepoint),
+                                   margin = 1)
+
+h1 <- ggplot(as.data.frame(t.propTimepointbyCelltype),aes(x=Var1,y=Freq)) +
+  geom_bar(stat = "identity",aes(fill=Var2)) +
+  theme_bw() +
+  xlab("CellType") +
+  labs(fill="Timepoint") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  theme(legend.text=element_blank(),
+        axis.text = element_text(size=10),
+        legend.position = "bottom",
+        legend.direction = "vertical",
+        legend.key.size = unit(0.2, 'lines'))
+
+t.propCelltypebyTimepoint <- 100*prop.table(table(SO2$timepoint,
+                                                SO2$cell_type),
+                                   margin = 1)
+
+h2 <- ggplot(as.data.frame(t.propCelltypebyTimepoint),aes(x=Var1,y=Freq)) +
+  geom_bar(stat = "identity",aes(fill=Var2)) +
+  theme_bw() +
+  xlab("Timepoint") +
+  labs(fill="CellType") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = colors_samples) +
+  theme(legend.text=element_text(size=10),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=10),
+        legend.position = "bottom",
+        legend.key.size = unit(0.9, 'lines'))
+
+t.propCelltypebyIntervalt <- 100*prop.table(table(SO2$intervalt,
+                                                SO2$cell_type),
+                                   margin = 1)
+
+h3 <- ggplot(as.data.frame(t.propCelltypebyIntervalt),aes(x=Var1,y=Freq)) +
+  geom_bar(stat = "identity",aes(fill=Var2)) +
+  theme_bw() +
+  xlab("Timepoint Interval") +
+  labs(fill="CellType") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  scale_fill_manual(values = colors_samples) +
+  theme(legend.text=element_text(size=10),
+        axis.text = element_text(size=10),
+        legend.position = "bottom",
+        legend.key.size = unit(0.9, 'lines'))
+
+h1 + h2 + h3
+```
+
+\
+
+
+##### Violin Plots of Timepoints by Cluster and Celltype
+
+
+```{r}
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin, 
+                           draw_group = function(self, data, ..., draw_quantiles = NULL) {
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1, "group"]
+  newdata <- plyr::arrange(transform(data, x = if (grp %% 2 == 1) xminv else xmaxv), if (grp %% 2 == 1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1, nrow(newdata) - 1, nrow(newdata)), "x"] <- round(newdata[1, "x"])
+
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <=
+      1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function(mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ..., 
+                              draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE, 
+                              show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin, 
+        position = position, show.legend = show.legend, inherit.aes = inherit.aes, 
+        params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+```
+
+```{r}
+
+my_data <- SO2@meta.data[c("ntimepoint", "cell_type", "res.Final")]
+
+ggplot(my_data, aes(res.Final, ntimepoint, fill = cell_type, colour = cell_type)) + 
+  geom_split_violin(nudge = 0.001) +
+  facet_wrap(~ cut(as.numeric(my_data$res.Final),2), scales="free_x", nrow = 2) +
+  theme_bw() +
+  xlab("Cluster") + ylab("Timepoint") +
+  labs(fill="CellType") +
+  guides(color = FALSE) +
+  scale_fill_manual(values = colors_samples) +
+  theme(legend.text=element_text(size=10),
+        axis.text = element_text(size=10),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        legend.position = "bottom",
+        legend.key.size = unit(0.9, 'lines'))
+
+```
+
+
+\
+
+
+#### Final Results tSNE
+
+\
+
+##### Plot CellTypes, Timepoints, IDs and clustering
+
+```{r, fig.asp=0.3, fig.width=12}
+
+g1 <- DimPlot(SO, 
+              reduction = "tSNE.Final", 
+              group.by = "cell_type",
+              cols = scales::hue_pal()(length(unique(SO$cell_type))),
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=10),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g2 <- DimPlot(SO, 
+              reduction = "tSNE.Final", 
+              group.by = "res.Final",
+              cols = colors_clusters,
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g1 + g2 
+
+```
+
+
+\
+
+```{r, fig.asp=0.3, fig.width=12}
+
+
+FeaturePlot(SO2, 
+              reduction = "tSNE.Final", 
+              features = c("node_id2","ntimepoint"),
+              ) & 
+  scale_colour_gradientn(colors=color_expression,na.value="grey90") &
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") 
+
+
+
+```
+
+\
+
+##### Plot Parameters
+
+```{r include=FALSE}
+h1 <- NULL
+
+var2an <- VariableFeatures(SO)
+
+d <- FetchData(object = SO, vars = var2an)
+minmaxexp <- quantile(as.matrix(d) , probs=c(0.05,0.95))
+
+d <- NULL
+
+for (i in seq(1,length(var2an))){
+  h1[[i]] <- FeaturePlot(SO,
+              features = var2an[i],
+              slot = "data",
+              reduction = "tSNE.Final",
+              combine = TRUE,
+              by.col = TRUE,
+              raster=TRUE
+            ) + scale_colour_gradientn(colors=color_expression,na.value="grey90") +
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") 
+
+}
+```
+
+
+```{r, fig.asp=0.75, fig.width=12}
+
+allps <- unlist(lapply(X = h1,function(x){strsplit(x$labels$title,'-')[[1]][1]}))
+
+for (p in unique(allps)){
+  kk <- patchwork::wrap_plots(h1[allps==p], ncol = 4) &
+    theme(legend.text=element_text(size=6),
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          axis.text = element_text(size=8),
+          title = element_text(size=12),
+          axis.title = element_text(size=12),
+          legend.key.size = unit(0.5, 'lines')
+          ) & xlab("") & ylab("")
+  
+  print(kk)
+}
+
+```
+
+
+\
+
+##### Plot segregated timepoints
+
+```{r, fig.width=10, fig.asp=0.6}
+
+g1<- DimPlot(SO2, 
+              reduction = "tSNE.Final", 
+              group.by = "cell_type",
+              split.by = "intervalt",
+              cols = scales::hue_pal()(length(unique(SO$cell_type))),
+              shuffle = TRUE) & #+ plot_layout(guides="collect") &
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=10),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g2 <- DimPlot(SO2, 
+              reduction = "tSNE.Final", 
+              group.by = "res.Final",
+              split.by = "intervalt",
+              cols = colors_clusters,
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+do.call("grid.arrange", c(list(g1,g2), ncol=1,top=""))
+
+g3 <- FeaturePlot(SO2, 
+              reduction = "tSNE.Final", 
+              features = "ntimepoint",
+              split.by = "intervalt",
+              cols=c("red","blue"), 
+              ) & 
+
+  theme(axis.text = element_text(size=6),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g3
+
+```
+
+
+\
+
+
+
+#### Final Results UMAP
+
+\
+
+##### Plot CellTypes, Timepoints, IDs and clustering
+
+```{r, fig.asp=0.3, fig.width=12}
+
+g1 <- DimPlot(SO, 
+              reduction = "UMAP.Final", 
+              group.by = "cell_type",
+              cols = scales::hue_pal()(length(unique(SO$cell_type))),
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=10),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g2 <- DimPlot(SO, 
+              reduction = "UMAP.Final", 
+              group.by = "res.Final",
+              cols = colors_clusters,
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g1 + g2
+
+```
+
+\
+
+```{r, fig.asp=0.3, fig.width=12}
+FeaturePlot(SO2, 
+              reduction = "UMAP.Final", 
+              features = c("node_id2","ntimepoint"),
+              ) & 
+  scale_colour_gradientn(colors=color_expression,na.value="grey90") &
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") 
+
+
+
+```
+
+\
+
+##### Plot Parameters
+
+```{r include=FALSE}
+h1 <- NULL
+
+var2an <- VariableFeatures(SO)
+
+d <- FetchData(object = SO, vars = var2an)
+minmaxexp <- quantile(as.matrix(d) , probs=c(0.05,0.95))
+
+d <- NULL
+
+for (i in seq(1,length(var2an))){
+  h1[[i]] <- FeaturePlot(SO,
+              features = var2an[i],
+              slot = "data",
+              reduction = "UMAP.Final",
+              combine = TRUE,
+              by.col = TRUE,
+              raster=TRUE
+            ) + scale_colour_gradientn(colors=color_expression,na.value="grey90") +
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on") 
+}
+```
+
+
+```{r, fig.asp=0.75, fig.width=12}
+allps <- unlist(lapply(X = h1,function(x){strsplit(x$labels$title,'-')[[1]][1]}))
+
+for (p in unique(allps)){
+  kk <- patchwork::wrap_plots(h1[allps==p], ncol = 4) &
+    theme(legend.text=element_text(size=6),
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          axis.text = element_text(size=8),
+          title = element_text(size=12),
+          axis.title = element_text(size=12),
+          legend.key.size = unit(0.5, 'lines')
+          ) & xlab("") & ylab("")
+  
+  print(kk)
+}
+
+```
+
+\
+
+##### Plot segregated timepoints
+
+```{r, fig.width=10, fig.asp=0.6}
+
+g1<- DimPlot(SO2,
+              reduction = "UMAP.Final", 
+              group.by = "cell_type",
+              split.by = "intervalt",
+              cols = scales::hue_pal()(length(unique(SO$cell_type))),
+              shuffle = TRUE) & 
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=10),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g2 <- DimPlot(SO2, 
+              reduction = "UMAP.Final", 
+              group.by = "res.Final",
+              split.by = "intervalt",
+              cols = colors_clusters,
+              shuffle = TRUE) & #+ plot_layout(guides="collect") &
+  theme(axis.text = element_text(size=10),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+do.call("grid.arrange", c(list(g1,g2), ncol=1,top=""))
+
+g3 <- FeaturePlot(SO2, 
+              reduction = "UMAP.Final", 
+              features = "ntimepoint",
+              split.by = "intervalt",
+              cols=c("red","blue"), #c("blue","red"),
+              ) & 
+  theme(axis.text = element_text(size=6),
+        title = element_text(size=10),
+        axis.title = element_text(size=10),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.5, 'lines')) &
+  coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+
+g3
+
+```
+
+\
+
+\
+
+
+# Extract coordinate correspondences
+
+For unsupervised analysis, we got rid of duplicates that correspond to the same parent cell and timepoint from different final cells (children), that have all measurements (and in all windows used!) equal. When doing that, we generate a new and different node_id and loose the identity of the track.
+
+To recover it, we generate a table of original node_id and the ones used within the Seurat object.
+
+```{r}
+
+if (!file.exists(file.path(path_track, paste0(file_track,"_alltracks_alloriginal_node_id.csv")))){
+  
+  df_coords <- read.csv(file = file.path(path_track,paste0(file_track,"_alltracks.csv")),row.names=1)
+  idx_dup <- which(duplicated(df_coords[,c("node_id","timepoint")]) | 
+                        duplicated(df_coords[,c("node_id","timepoint")], fromLast = TRUE))
+  df_coords <- df_coords[!duplicated(df_coords[,c("node_id","timepoint")]),]
+  rownames(df_coords) <- NULL
+  
+  df3 <- read.csv(file = file.path(path_track, paste0(file_track,"_final_table_timepoints_TOT_wide_clean.csv")))
+  
+  
+  kk2 <- df3 %>% dplyr::group_by(across(c(-node_id))) %>% 
+    dplyr::mutate(node_id_sum = sum(node_id), N_rep=n_distinct(node_id)) %>% 
+    ungroup() %>% dplyr::select(c("node_id", "timepoint","node_id_sum","N_rep"))
+  
+  df_coords3 <- df_coords %>%
+    dplyr::left_join(kk2 %>% dplyr::select(node_id, timepoint, node_id_sum, N_rep))
+  
+  df_coords4 <- df_coords3
+  df_coords4$node_id_orig <- df_coords4$node_id
+  df_coords4$node_id <- as.factor(df_coords4$node_id_sum)
+  df_coords4$timepoint <- as.factor(df_coords4$timepoint)
+  df_coords4$node_id_sum <- NULL
+  df_coords4 <- df_coords4 %>% dplyr::arrange(desc(N_rep), desc(node_id), timepoint, node_id_orig)
+  
+  write.csv(df_coords4,file.path(path_track, paste0(file_track,"_alltracks_alloriginal_node_id.csv")),row.names = F)
+}
+
+```
+
+File: `r paste0(file_track,"_alltracks_alloriginal_node_id.csv")`
+
+
+
+```{r}
+
+path_details_track_emb1 <- "S:/LAB_MT/RESULTADOS/U_Bioinformatica/MSendra/Dani_Tracking4D/tracks_coordinatesXYZ/tracks_detailed_celltype"
+
+file_details_track_emb1 <- file.path(path_details_track_emb1, "KM1_tracking.xlsx")
+
+detailed_emb1 <- readxl::read_excel(path = file_details_track_emb1,sheet = 1) #%>%
+detailed_emb2 <- detailed_emb1[0]
+
+
+kkk <- read.csv(file.path(path_track, paste0(file_track,"_alltracks_alloriginal_node_id.csv")))
+
+new_SOmeta <- dplyr::left_join(kkk,
+                               rbind(detailed_emb1,detailed_emb2) %>% 
+                                 dplyr::mutate(node_id_orig = node_id) %>%
+                                 select(node_id_orig,track_name,cell_type,cell_type_detailed)
+                               )
+
+```
+
+
+
+\
+
+
+# Include cell_type_detailed in Seurat object
+
+
+```{r, fig.asp=1.2}
+
+final_objs <- list.files(path = path_track, pattern = paste0(file_track,"_SO4_final",".*\\.rds$"))
+
+for (fileSOi in final_objs){
+  if (file.exists(file.path(path_track,sub("_SO4_final","_SO6_final",fileSOi)))){
+    SOi <- readRDS(file.path(path_track,sub("_SO4_final","_SO6_final",fileSOi)))
+  }else{
+    SOi <- readRDS(file = file.path(path_track,fileSOi))
+    
+    old_SOmetai <- SOi@meta.data
+    old_SOmetai$node_id <- as.numeric(as.character(old_SOmetai$node_id))
+    old_SOmetai$timepoint <- as.numeric(as.character(old_SOmetai$timepoint))
+    new_SOmetai <- dplyr::left_join(old_SOmetai,
+                                    new_SOmeta,
+                                    multiple="first"
+                                    )
+    SOi@meta.data <- new_SOmetai
+    SOi$Embryo <- "EMB1"
+    
+    SOi$node_id2 <- as.numeric(as.character(SOi$node_id))
+    SOi$ntimepoint <- as.numeric(as.character(SOi$timepoint))
+    SOi$intervalt <- cut(SOi$ntimepoint,ntimepoints)
+    
+    saveRDS(SOi, file.path(path_track,sub("_SO4_final","_SO6_final",fileSOi)))
+  }
+  
+  # Only for the first option we display
+  if (!grepl("_SO4_final_W",fileSOi)){
+    g1 <- DimPlot(SOi,
+                  reduction = "tSNE.Final",
+                  group.by = "cell_type",
+                  cols = scales::hue_pal()(length(unique(SOi$cell_type))),
+                  shuffle = TRUE) & 
+      theme(axis.text = element_text(size=10),
+            title = element_text(size=10),
+            axis.title = element_text(size=10),
+            legend.text=element_text(size=8),
+            legend.position = "bottom",
+            legend.direction = "vertical",
+            legend.key.size = unit(0.5, 'lines')) &
+      coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+    g2 <- DimPlot(SOi,
+                  reduction = "tSNE.Final",
+                  group.by = "cell_type_detailed",
+                  cols = RColorBrewer::brewer.pal(8,name = "Set1")[1:length(unique(SOi$cell_type_detailed))],
+                  shuffle = TRUE) & 
+      theme(axis.text = element_text(size=10),
+            title = element_text(size=10),
+            axis.title = element_text(size=10),
+            legend.text=element_text(size=8),
+            legend.position = "bottom",
+            legend.direction = "horizontal",
+            legend.key.size = unit(0.5, 'lines')) &
+      coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+    
+    g5 <- DimPlot(SOi,
+                  reduction = "tSNE.Final",
+                  group.by = "cell_type_detailed",
+                  cols = RColorBrewer::brewer.pal(8,name = "Set1")[1:length(unique(SOi$cell_type_detailed))],
+                  shuffle = FALSE) & 
+      theme(axis.text = element_text(size=10),
+            title = element_text(size=10),
+            axis.title = element_text(size=10),
+            legend.text=element_text(size=8),
+            legend.position = "bottom",
+            legend.direction = "vertical",
+            legend.key.size = unit(0.5, 'lines')) &
+      coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+    g4 <- DimPlot(SOi,
+                  reduction = "tSNE.Final",
+                  group.by = "res.Final",
+                  cols = colors_clusters,
+                  shuffle = TRUE) & 
+      theme(axis.text = element_text(size=10),
+            title = element_text(size=10),
+            axis.title = element_text(size=10),
+            legend.text=element_text(size=8),
+            legend.position = "bottom",
+            legend.key.size = unit(0.5, 'lines')) &
+      coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+  
+    g3 <- DimPlot(SOi,
+                  reduction = "tSNE.Final",
+                  group.by = "Embryo",
+                  cols = RColorBrewer::brewer.pal(8,name = "Set2")[1:(length(unique(SOi$Embryo)))],
+                  shuffle = TRUE) & 
+      theme(axis.text = element_text(size=10),
+            title = element_text(size=10),
+            axis.title = element_text(size=10),
+            legend.text=element_text(size=8),
+            legend.position = "bottom",
+            legend.direction = "vertical",
+            legend.key.size = unit(0.5, 'lines')) &
+      coord_fixed(ratio = 1, xlim = NULL, ylim = NULL, expand = TRUE, clip = "on")
+  
+  
+    (do.call("grid.arrange",c(list(g1,g2,g3,g4), ncol=2,top="")))
+    
+    (do.call("grid.arrange",c(list(g2,g5), ncol=2,top="shuffle VS ordered print")) )
+    
+  }
+
+}
+
+```
+
+
+

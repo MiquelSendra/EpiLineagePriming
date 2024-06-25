@@ -1,0 +1,857 @@
+---
+title: "Mouse Embryo E6.5 single cell ATAC-seq integration"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    self_contained: no
+    number_sections: yes
+    toc: yes
+    toc_depth: 6
+    toc_float:
+      collapsed: no
+---
+
+Version 2: Updated reference (mm10 v98)
+Version 3: Only using standard chromosomes
+Version 4: Re-clustering epiblast without C5 and C7
+Version 5: Integrating all cells from E6.5
+
+```{r setup, include=F}
+toInclude <- F
+projectPath <- file.path("/data3/crelanor/SC.analysis.cluster/MSendra.scATACseq/data_integration")
+analysisDir <- "scATAC.integrated.full.embryo"
+analysisPath <- file.path(projectPath,analysisDir)
+outputDir <- "scATAC.integrated.output"
+outputPath <- file.path(analysisPath,outputDir)
+dataDir <- "data"
+dataPath <- file.path(projectPath,dataDir)
+
+prefix <- "scATAC.integrated"
+dir.create(file.path(outputPath),recursive = T)
+
+# setwd(analysisPath)
+
+knitr::opts_knit$set(
+  base.dir = file.path(outputPath),
+  self.contained = F
+)
+
+knitr::opts_chunk$set(
+    dev = c("jpeg","pdf"),
+	  dpi = 300,
+    echo = F,
+    fig.align = "center",
+    fig.pos = "H",
+    message = F,
+    warning = F,
+    comment = NA
+)
+
+suppressMessages(library(Seurat))
+suppressMessages(library(Signac))
+
+suppressMessages(library(scater))
+suppressMessages(library(SingleR))
+suppressMessages(library(biomaRt))
+suppressMessages(library(ReactomePA))
+suppressMessages(library(enrichR))
+suppressMessages(library(scDblFinder))
+
+suppressMessages(library(clustree))
+suppressMessages(library(tidyverse))
+suppressMessages(library(reshape2))
+suppressMessages(library(openxlsx))
+
+suppressMessages(library(DT))
+suppressMessages(library(kableExtra))
+suppressMessages(library(slickR))
+suppressMessages(library(gtools))
+suppressMessages(library(Matrix))
+
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(gplots))
+suppressMessages(library(ComplexHeatmap))
+suppressMessages(library(circlize))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(gridExtra))
+suppressMessages(library(ggrepel))
+suppressMessages(library(ggridges))
+suppressMessages(library(dplyr))
+
+source(file.path("/data3/crelanor/scripts/helperFunctions.V5.R"))
+
+
+commonName <- "mouse"
+wspecies <- "Mus_musculus"
+sp <- "mmusculus"
+spGeneNames <- "mgi_symbol"
+genebuildVersion <- "98"
+genomeVersion <- "GRCm38"
+archive <- "sep2019.archive"
+
+wikiUrl <- "https://www.wikigenes.org/e/gene/e/"
+# http://www.genecards.org/cgi-bin/carddisp.pl?gene=HBB
+geneCardUrl <- "http://www.genecards.org/cgi-bin/carddisp.pl?gene="
+# http://mar2016.archive.ensembl.org/Mus_musculus/Gene/Summary?db=core;g=ENSMUSG00000078674
+ensemblUrl <- paste("http://",archive,".ensembl.org/",wspecies,"/Gene/Summary?db=core;g=",sep="")
+# http://www.informatics.jax.org/marker/MGI:101787
+#mgiUrl <- "http://www.informatics.jax.org/marker/"
+# http://www.uniprot.org/uniprot/A2BIM8
+uniprotUrl <- "http://www.uniprot.org/uniprot/"
+
+```
+
+# Integration with Arguelaguet2020
+
+```{r}
+run <- F
+```
+
+
+```{r}
+## Create common peak set
+if (run){
+  seuratSC <- readRDS("/data3/crelanor/SC.analysis.cluster/MSendra.scATACseq/data_integration/data/MSendra/scATAC.embryo.All.All.seuratSC.Final.rds")
+
+  saveRDS(seuratSC@meta.data, "/data3/crelanor/SC.analysis.cluster/MSendra.scATACseq/data_integration/data/MSendra/cell.metadata.full.rds")
+}
+
+arg.meta <- read.csv("/data3/crelanor/SC.analysis.cluster/MSendra.scATACseq/data_integration/data/Arguelaguet2020/sample_metadata.txt.gz", sep = "\t")
+```
+
+```{r}
+if (run){
+  
+  # read in peak sets
+  peaks.sendra <- read.table(
+    file = "data/MSendra/filtered_peak_bc_matrix/peaks.bed",
+    col.names = c("chr", "start", "end")
+  )
+  
+  peaks.7.5.1 <- read.table(
+    file = "data/Arguelaguet2020/E7.5_rep1/filtered_feature_bc_matrix/features.tsv.gz", sep = "\t") %>% 
+    filter(V3 == "Peaks") %>% 
+    dplyr::select(V4:V6)
+  colnames(peaks.7.5.1) <- c("chr", "start", "end")
+  
+  peaks.7.5.2 <- read.table(
+    file = "data/Arguelaguet2020/E7.5_rep2/filtered_feature_bc_matrix/features.tsv.gz", sep = "\t") %>% 
+    filter(V3 == "Peaks") %>% 
+    dplyr::select(V4:V6)
+  colnames(peaks.7.5.2) <- c("chr", "start", "end")
+  
+  # convert to genomic ranges
+  gr.sendra <- makeGRangesFromDataFrame(peaks.sendra)
+  gr.7.5.1 <- makeGRangesFromDataFrame(peaks.7.5.1)
+  gr.7.5.2 <- makeGRangesFromDataFrame(peaks.7.5.2)
+  
+  # Create a unified set of peaks to quantify in each dataset
+  combined.peaks <- IRanges::reduce(x = c(gr.sendra, gr.7.5.1, gr.7.5.2))
+  
+  # Filter out bad peaks based on length
+  peakwidths <- width(combined.peaks)
+  combined.peaks <- combined.peaks[peakwidths  < 10000 & peakwidths > 20]
+  combined.peaks %>% as.data.frame() %>%
+    dplyr::select(seqnames:end) %>%
+    write.table("data/integration/combined.peaks.bed", sep = "\t",
+                quote = F, col.names = F, row.names = F)
+}
+
+combined.peaks <- read.table("data/integration/combined.peaks.bed", col.names = c("chr", "start", "end")) %>% makeGRangesFromDataFrame()
+```
+
+```{r}
+if (run){
+
+  ### Fragment objects
+  md.sendra <- readRDS("data/MSendra/cell.metadata.full.rds")
+  
+  md.7.5.1 <- arg.meta %>% filter(sample == "E7.5_rep1") %>%
+    column_to_rownames("barcode")
+  md.7.5.2 <- arg.meta %>% filter(sample == "E7.5_rep2") %>%
+    column_to_rownames("barcode")
+  
+  frags.sendra <- CreateFragmentObject("data/MSendra/fragments.tsv.gz",
+                                       cells = rownames(md.sendra))
+  
+  counts.sendra <- FeatureMatrix(
+    fragments = frags.sendra,
+    features = combined.peaks,
+    cells = rownames(md.sendra)
+  )
+  
+  saveRDS(counts.sendra, "data/integration/combined.peaks.counts.sendra.full.rds")
+  
+  ## E7.5.1
+  frags.7.5.1 <- CreateFragmentObject("data/Arguelaguet2020/E7.5_rep1/atac_fragments.tsv.gz",
+                                       cells = rownames(md.7.5.1))
+  
+  counts.7.5.1 <- FeatureMatrix(
+    fragments = frags.7.5.1,
+    features = combined.peaks,
+    cells = rownames(md.7.5.1)
+  )
+  
+  saveRDS(counts.7.5.1, "data/integration/combined.peaks.counts.7.5.1.rds")
+  
+  ## E7.5.2
+  frags.7.5.2 <- CreateFragmentObject("data/Arguelaguet2020/E7.5_rep2/atac_fragments.tsv.gz",
+                                       cells = rownames(md.7.5.2))
+  
+  counts.7.5.2 <- FeatureMatrix(
+    fragments = frags.7.5.2,
+    features = combined.peaks,
+    cells = rownames(md.7.5.2)
+  )
+  
+  saveRDS(counts.7.5.2, "data/integration/combined.peaks.counts.7.5.2.rds")
+}
+```
+
+# Analysis using Seurat & Signac
+
+```{r }
+cellSet <- "integrated.full.embryo"
+subsetName <- "All"
+```
+
+```{r }
+if (file.exists(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Raw","rds",sep=".")))){
+  
+  seuratSC <- readRDS(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Raw","rds",sep=".")))
+  
+}else{
+  
+  ## Load metadata
+  md.sendra <- readRDS("data/MSendra/cell.metadata.full.rds")
+  md.7.5.1 <- arg.meta %>% filter(sample == "E7.5_rep1") %>%
+    column_to_rownames("barcode")
+  md.7.5.2 <- arg.meta %>% filter(sample == "E7.5_rep2") %>%
+    column_to_rownames("barcode")
+  
+  # Load counts
+  
+  counts.sendra <- readRDS("data/integration/combined.peaks.counts.sendra.full.rds")
+  counts.7.5.1 <- readRDS("data/integration/combined.peaks.counts.7.5.1.rds")
+  counts.7.5.2 <- readRDS("data/integration/combined.peaks.counts.7.5.2.rds")
+  
+  ## Load fragments
+  
+  frags.sendra <- CreateFragmentObject("data/MSendra/fragments.tsv.gz",
+                                       cells = rownames(md.sendra))
+  frags.7.5.1 <- CreateFragmentObject("data/Arguelaguet2020/E7.5_rep1/atac_fragments.tsv.gz",
+                                       cells = rownames(md.7.5.1))
+  frags.7.5.2 <- CreateFragmentObject("data/Arguelaguet2020/E7.5_rep2/atac_fragments.tsv.gz",
+                                       cells = rownames(md.7.5.2))
+  
+  assay.sendra <- CreateChromatinAssay(counts = counts.sendra, fragments = frags.sendra)
+seurat.sendra <- CreateSeuratObject(assay.sendra, assay = "ATAC", meta.data=md.sendra)
+
+assay.7.5.1 <- CreateChromatinAssay(counts = counts.7.5.1, fragments = frags.7.5.1)
+seurat.7.5.1 <- CreateSeuratObject(assay.7.5.1, assay = "ATAC", meta.data=md.7.5.1)
+
+assay.7.5.2 <- CreateChromatinAssay(counts = counts.7.5.2, fragments = frags.7.5.2)
+seurat.7.5.2 <- CreateSeuratObject(assay.7.5.2, assay = "ATAC", meta.data=md.7.5.2)
+
+seurat.sendra$dataset <- "Sendra"
+seurat.7.5.1$dataset <- "E7.5_1"
+seurat.7.5.2$dataset <- "E7.5_2"
+
+seuratSC <- merge(x=seurat.sendra, 
+                  y=list(seurat.7.5.1, seurat.7.5.2),
+                  add.cell.ids = c("Sendra", "E7.5_1", "E7.5_2"))
+
+# we'll only use peaks in standard chromosomes
+  grange.counts <- StringToGRanges(rownames(seuratSC), sep = c(":", "-"))
+  grange.use <- seqnames(grange.counts) %in% standardChromosomes(grange.counts)
+
+  seuratSC <- seuratSC[as.logical(grange.use), ]
+
+  saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Raw","rds",sep=".")))
+}
+
+```
+
+```{r }
+if (is.null(Annotation(seuratSC))){
+
+## Get annotations for mm10 Ensembl v98
+library(AnnotationHub)
+
+ah <- AnnotationHub()
+
+ahDb <- query(ah, pattern = c("Mus musculus", "EnsDb", 98))
+ahEdb <- ahDb[[1]]
+
+annotations <- GetGRangesFromEnsDb(ensdb = ahEdb)
+
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "mm10"
+
+# add the gene information to the object
+Annotation(seuratSC) <- annotations
+
+saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Raw","rds",sep=".")))
+}
+```
+
+
+## Quality control
+
+```{r }
+if (!"nucleosome_signal" %in% colnames(seuratSC@meta.data)){
+  
+  # compute nucleosome signal score per cell
+
+seuratSC <- NucleosomeSignal(object = seuratSC)
+
+# compute TSS enrichment score per cell
+seuratSC <- TSSEnrichment(object = seuratSC, fast = FALSE)
+
+# add blacklist ratio and fraction of reads in peaks
+seuratSC$pct_reads_in_peaks <- seuratSC$peak_region_fragments / seuratSC$passed_filters * 100
+seuratSC$blacklist_ratio <- seuratSC$blacklist_region_fragments / seuratSC$peak_region_fragments
+
+saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Raw","rds",sep=".")))
+}
+```
+
+
+```{r }
+DensityScatter(seuratSC, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE, )
+```
+```{r }
+# seuratSC$nucleosome_group <- ifelse(seuratSC$nucleosome_signal > 4, 'NS > 4', 'NS < 4')
+# 
+# FragmentHistogram(object = seuratSC, 
+#                 assay = "ATAC",
+#                 group.by = 'nucleosome_group', 
+#                 region = 'chr1-1-100000000')
+```
+
+```{r }
+seuratSC$high.tss <- ifelse(seuratSC$TSS.enrichment > 3, 'High', 'Low')
+TSSPlot(seuratSC, group.by = 'high.tss', assay = "ATAC") + NoLegend()
+```
+
+```{r, fig.width=20, fig.height=5}
+VlnPlot(
+  object = seuratSC,
+  features = c('nCount_ATAC', 'TSS.enrichment', 'nucleosome_signal'),
+  pt.size = 0.01,
+  ncol = 3,
+  group.by = "dataset"
+)
+```
+
+These are the filters I set for the original analysis, but I haven't applied them here. Our data is filtered, but the 7.5 is not (they used their own filter, and doesn't look very different)
+
+min_nCount_peaks = 1500,
+max_ncount_peaks = 70000,
+min_pct_reads_in_peaks = 15,
+max_nucleosome_signal = 4,
+min_tss_enrichment = 3
+
+## Normalization
+
+```{r }
+useAssay <- "ATAC"
+# 
+# filters <- list(
+#   min_nCount_peaks = 1500,
+#   max_ncount_peaks = 70000,
+#   min_pct_reads_in_peaks = 15,
+#   max_nucleosome_signal = 4,
+#   min_tss_enrichment = 3
+# )
+
+
+if (file.exists(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))){
+  seuratSC <- readRDS(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))
+} else{
+  # seuratSC$filters <- seuratSC@meta.data %>% mutate(
+  # filters = nCount_ATAC > filters$min_nCount_peaks &
+  #   nCount_peaks < filters$max_ncount_peaks &
+  #   pct_reads_in_peaks > filters$min_pct_reads_in_peaks &
+  #   nucleosome_signal < filters$max_nucleosome_signal &
+  #   TSS.enrichment > filters$min_tss_enrichment) %>% pull(filters)
+  
+  seuratSC <- RunTFIDF(seuratSC)
+  seuratSC <- FindTopFeatures(seuratSC, min.cutoff = 'q75')
+  seuratSC <- RunSVD(seuratSC)
+  
+  saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC",useAssay,"rds",sep=".")))
+}
+
+```
+
+```{r }
+# filters %>% as.data.frame() %>% t() %>% 
+#   datatable(caption = "Filtering parameters",
+#             colnames = "",
+#             options = list(
+#             searching = FALSE,
+#             ordering = F,
+#             info = F,
+#             paging = F))
+```
+
+No filters were applied this time
+
+Total cells: `r ncol(seuratSC)`
+Total features (peaks): `r nrow(seuratSC@assays$ATAC)`
+
+
+## Dimensional reduction
+
+For scATAC seq, the first component usually captures technical variance, and it is not used downstream.
+
+```{r }
+DepthCor(seuratSC, n=30)
+```
+
+```{r }
+if (file.exists(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))){
+  seuratSC <- readRDS(file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))
+} else{
+  ress <- c(0.1,0.2,0.5,0.75)
+pcas <- 2:30
+
+seuratSC <- seuratSC %>%
+  FindNeighbors(reduction = 'lsi', dims = pcas,
+                verbose = T) %>%
+  FindClusters(algorithm = 3,
+               resolution = ress,
+               verbose = T) %>%
+  RunUMAP(reduction = 'lsi', dims = pcas)
+
+seuratSC@meta.data <- seuratSC@meta.data %>%
+    mutate(across(contains("ATAC_snn_res"),
+                  .fns = function (x) {
+                    return(paste0("C",x))
+                  })) %>%
+    mutate(across(contains("ATAC_snn_res"),.fns = factor)) %>%
+    mutate(across(contains("ATAC_snn_res"), .fns = function (x) {
+      return(factor(x,levels = mixedsort(levels(x))))
+    }))
+
+saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))
+}
+```
+
+```{r }
+
+seuratSC@meta.data[,grep("ATAC_snn",colnames(seuratSC@meta.data))] %>% pivot_longer(cols = everything(),names_to = "res", values_to = "cluster") %>% group_by(cluster) %>% table
+
+```
+
+```{r }
+clustering <- paste0("ATAC_snn_res.0.75")
+```
+
+<!-- ## Doublet identification -->
+<!-- ```{r} -->
+<!-- if (!"scDblFinder.class" %in% colnames(seuratSC@meta.data)){ -->
+<!--   sce <- scDblFinder::scDblFinder(as.SingleCellExperiment(seuratSC, assay = "peaks"), artificialDoublets=1, aggregateFeatures=TRUE, nfeatures=25, processing="normFeatures") -->
+
+<!-- sce$scDblFinder.class %>% table() -->
+
+<!-- all(colnames(sce@metadata) == colnames(seuratSC)) -->
+
+<!-- seuratSC$scDblFinder.class <- as.character(sce$scDblFinder.class) -->
+
+<!-- } -->
+
+
+<!-- DimPlot(seuratSC, reduction = "umap", group.by = "scDblFinder.class", cols = c("red", "grey")) -->
+<!-- ``` -->
+
+## UMAP representations
+
+```{r}
+## UMAP representations
+df <- Embeddings(seuratSC,reduction = "umap")
+dnames <- colnames(df)
+df <- cbind(df,seuratSC@meta.data)
+```
+
+
+```{r, include=toInclude}
+pList <- list()
+
+cvars <- c(clustering,
+           "celltype.predicted",
+           "celltype",
+           "dataset", 
+           "EmbryoTimecourse2018.E6.5.integrated",
+           # "peaks_snn_res.0.5.mod",
+           "res.Final"
+           # "scDblFinder.class"
+           # "clusters_old",
+           # "scDblFinderClusters.cluster", "scDblFinderClusters.class"
+           )
+           # "mmRNAFTLabelsSC")
+
+for (v in cvars) {
+  if (v == "ManualAnnotation"){
+    pList[[length(pList)+1]] <- df %>%
+      filter(!is.na(ManualAnnotation)) %>%
+    ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+    geom_point(aes_string(color = v)) +
+    scale_color_manual(values = color.list) +
+    theme_classic() 
+  }
+  else{  
+    pList[[length(pList)+1]] <- df %>%
+    ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+    geom_point(aes_string(color = v)) +
+    scale_color_manual(values = color.list) +
+    theme_classic()
+  }
+
+}
+
+nvars <- c("nCount_ATAC", "nFeature_ATAC", "nucleosome_signal", "TSS.enrichment")
+
+for (v in nvars) {
+  pList[[length(pList)+1]] <- df %>%
+  ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+  geom_point(aes_string(color = v)) +
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(11,"Spectral")),
+                        name=v) +
+  theme_classic()
+}
+
+plog <- lapply(pList,function (p) {suppressMessages(suppressWarnings(print(p)))})
+
+pNames <-  knitr::fig_path(suffix = ".jpeg", options = knitr::opts_current$get(),seq(length(pList)))
+slide_id <- paste0("slide",sub(".+-(\\d+)$$","\\1",knitr::opts_current$get()$label))
+```
+
+```{r }
+
+slickR::slickR(
+    pNames,
+    height = 600, slideId = slide_id,
+    width = '100%') + settings(lazyLoad = 'ondemand',
+                               slidesToShow = 1,
+                               adaptiveHeight = T,
+                               dots = T
+                               )
+
+```
+
+```{r, fig.asp=0.4, fig.width=10}
+DimPlot(seuratSC, split.by = "dataset", cols = color.list)
+# seuratSC$E_day <- seuratSC$dataset
+# seuratSC$E_day[seuratSC$E_day == "Sendra"] <- "E6.5" 
+# seuratSC$E_day[seuratSC$E_day != "E6.5"] <- "E7.5" 
+
+# DimPlot(seuratSC, split.by = "E_day", cols = color.list)
+```
+
+```{r, fig.width=12, fig.asp=0.6}
+DimPlot(seuratSC, group.by = "celltype", cols = color.list, label = T, repel = T)
+```
+
+```{r, fig.width=5, fig.asp=0.9}
+DimPlot(seuratSC, group.by = "res.Final", cols = color.list, label = T, repel = T)
+```
+
+# Integration (rlsi)
+
+```{r }
+cellSet <- "rlsi.all.embryo"
+subsetName <- "All"
+```
+
+```{r}
+if (file.exists(file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))){
+  seuratSC <- readRDS(file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))
+} else{
+
+  seurat.list <- SplitObject(seuratSC, "dataset")
+  
+  seurat.list <- lapply(seurat.list, function (x){
+    x %>% RunTFIDF %>%
+      FindTopFeatures(min.cutoff = 'q75') %>%
+      RunSVD()
+  })
+  
+  integration.anchors <- FindIntegrationAnchors(
+    object.list = seurat.list,
+    anchor.features = rownames(seurat.list$Sendra),
+    reduction = "rlsi",
+    dims = 2:30
+  )
+  
+  # integrate LSI embeddings
+  seuratSC <- IntegrateEmbeddings(
+    anchorset = integration.anchors,
+    reductions = seuratSC[["lsi"]],
+    new.reduction.name = "integrated_lsi",
+    dims.to.integrate = 1:30
+  )
+
+  # create a new UMAP using the integrated embeddings
+  seuratSC <- RunUMAP(seuratSC, reduction = "integrated_lsi", dims = 2:30)
+  
+   ress <- c(0.1,0.2,0.3, 0.4,0.5,0.75)
+  
+  seuratSC <- seuratSC %>%
+    FindNeighbors(reduction = "integrated_lsi",
+                  dims = 2:30, graph.name = "rlsi") %>%
+    FindClusters(resolution = ress, graph.name = "rlsi")
+  
+  seuratSC@meta.data <- seuratSC@meta.data %>%
+  mutate(across(contains("rlsi_res"),
+                .fns = function (x) {
+                  return(paste0("C",x))
+                })) %>%
+  mutate(across(contains("rlsi_res"),.fns = factor)) %>%
+  mutate(across(contains("rlsi_res"), .fns = function (x) {
+    return(factor(x,levels = mixedsort(levels(x))))
+  }))
+  
+  
+  seuratSC$mixed <- seuratSC$celltype
+  seuratSC$mixed[!is.na(seuratSC$res.Final)] <- seuratSC$res.Final
+  
+  saveRDS(seuratSC,file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","Final","rds",sep=".")))
+  
+}
+
+```
+
+```{r }
+seuratSC@meta.data[,grep("rlsi",colnames(seuratSC@meta.data))] %>% pivot_longer(cols = everything(),names_to = "res", values_to = "cluster") %>% group_by(cluster) %>% table
+
+```
+
+## UMAP representations
+
+```{r}
+## UMAP representations
+df <- Embeddings(seuratSC,reduction = "umap")
+dnames <- colnames(df)
+df <- cbind(df,seuratSC@meta.data)
+```
+
+
+```{r, include=toInclude}
+clustering <- "rlsi_res.0.75"
+
+pList <- list()
+
+cvars <- c("mixed",
+           clustering,
+           "celltype.predicted",
+           "celltype",
+           "dataset", 
+           "EmbryoTimecourse2018.E6.5.integrated",
+           # "peaks_snn_res.0.5.mod",
+           "res.Final"
+           # "scDblFinder.class"
+           # "clusters_old",
+           # "scDblFinderClusters.cluster", "scDblFinderClusters.class"
+           )
+           # "mmRNAFTLabelsSC")
+
+for (v in cvars) {
+  if (v == "ManualAnnotation"){
+    pList[[length(pList)+1]] <- df %>%
+      filter(!is.na(ManualAnnotation)) %>%
+    ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+    geom_point(aes_string(color = v)) +
+    scale_color_manual(values = c(color.list, color.list)) +
+    theme_classic() 
+  }
+  else{  
+    pList[[length(pList)+1]] <- df %>%
+    ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+    geom_point(aes_string(color = v)) +
+    scale_color_manual(values = c(color.list, color.list)) +
+    theme_classic()
+  }
+
+}
+
+nvars <- c("nCount_ATAC", "nFeature_ATAC", "nucleosome_signal", "TSS.enrichment")
+
+for (v in nvars) {
+  pList[[length(pList)+1]] <- df %>%
+  ggplot(aes_string(x=dnames[1], y=dnames[2])) +
+  geom_point(aes_string(color = v)) +
+  scale_color_gradientn(colors = rev(RColorBrewer::brewer.pal(11,"Spectral")),
+                        name=v) +
+  theme_classic()
+}
+
+plog <- lapply(pList,function (p) {suppressMessages(suppressWarnings(print(p)))})
+
+pNames <-  knitr::fig_path(suffix = ".jpeg", options = knitr::opts_current$get(),seq(length(pList)))
+slide_id <- paste0("slide",sub(".+-(\\d+)$$","\\1",knitr::opts_current$get()$label))
+```
+
+```{r }
+
+slickR::slickR(
+    pNames,
+    height = 600, slideId = slide_id,
+    width = '100%') + settings(lazyLoad = 'ondemand',
+                               slidesToShow = 1,
+                               adaptiveHeight = T,
+                               dots = T
+                               )
+
+```
+
+```{r, fig.asp=0.4, fig.width=10}
+DimPlot(seuratSC, split.by = "dataset", cols = color.list)
+# seuratSC$E_day <- seuratSC$dataset
+# seuratSC$E_day[seuratSC$E_day == "Sendra"] <- "E6.5" 
+# seuratSC$E_day[seuratSC$E_day != "E6.5"] <- "E7.5" 
+
+# DimPlot(seuratSC, split.by = "E_day", cols = color.list)
+```
+
+```{r, fig.width=12, fig.asp=0.6}
+DimPlot(seuratSC, group.by = "celltype", cols = color.list, label = T, repel = T)
+```
+
+```{r, fig.width=5, fig.asp=0.9}
+# DimPlot(seuratSC, group.by = "mixed", cols = c(color.list, color.list, color.list), label = T, repel = T)
+```
+
+```{r}
+# mini <- seuratSC
+# 
+# mini@assays$ATAC@data@x <- 0
+# mini@assays$ATAC@counts@x <- 0
+# 
+# saveRDS(mini, file = file.path(outputPath,paste(prefix,subsetName,cellSet,"seuratSC","mini","rds",sep=".")))
+```
+
+
+<!-- ## Marker peaks by cluster -->
+
+<!-- ```{r } -->
+
+<!-- cellSet <- "rlsi.all.embryo" -->
+<!-- subsetName <- "All" -->
+<!-- contrastType <- "DEvsAll.peaks" -->
+<!-- clustering <- "rlsi_res.0.75" -->
+<!-- latvars <- c("nCount_peaks") -->
+<!-- Idents(seuratSC) <- clustering # Ya se ha hecho antes -->
+<!-- testUse <- "LR" -->
+
+<!-- minPct <- 30 -->
+<!-- pval <- 0.01 -->
+
+<!-- ``` -->
+
+<!-- Only features detected over `r minPct`% in the cells of any of the groups compared are analyzed. An Adjusted P-value of `r pval` is used as significance threshold. This setting can be tuned later. Either, genes up- and down-regulated are considered. -->
+
+<!-- ```{r } -->
+<!-- DefaultAssay(seuratSC) <- 'ATAC' -->
+<!-- useAssay <- "ATAC" -->
+
+<!-- if (file.exists(file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"rds",sep=".")))) { -->
+
+<!--   message(paste("reading Cluster Markers from",file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"rds",sep=".")))) -->
+<!--   Cluster.markers <- readRDS(file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"rds",sep="."))) -->
+
+<!-- } else { -->
+
+<!--   message(paste("Find Markers","contrastsBtwnClusters",subsetName,cellSet,contrastType,clustering)) -->
+
+<!--   Cluster.markers <- seuratSC %>% -->
+<!--     FindAllMarkers( -->
+<!--       assay = useAssay -->
+<!--       # , slot = "data" -->
+<!--       , min.pct = minPct/100 -->
+<!--       , return.thresh = pval -->
+<!--       , test.use = testUse -->
+<!--       , verbose = T -->
+<!--       , only.pos = T -->
+<!--       , latent.vars = latvars -->
+<!--     ) -->
+
+<!--   saveRDS(Cluster.markers, "scATAC.integrated/scATAC.integrated.output/cluster.markers.raw.rds") -->
+<!--   Cluster.markers %>% -->
+<!--     rename(region = "gene") %>% -->
+<!--     left_join(ClosestFeature(seuratSC, regions = rownames(Cluster.markers)), -->
+<!--               by = join_by(region == query_region)) -> Cluster.markers -->
+
+<!--   saveRDS(Cluster.markers, file.path(outputPath, "marker.peaks.save.rds")) -->
+
+<!--   # rownames(Cluster.markers) <- Cluster.markers$region -->
+
+<!-- Cluster.markers %>% -->
+<!--   filter(!is.na(closest_region)) %>% -->
+<!--   mutate(anterior = StringToGRanges(region) < StringToGRanges(closest_region)) %>% -->
+<!--   mutate(in_gene_region = distance == 0 | (distance < 2000 & anterior == T)) -> Cluster.markers -->
+
+<!-- Cluster.markers %>% -->
+<!--     rename( -->
+<!--       pct_cluster = "pct.1", -->
+<!--       pct_rest = "pct.2" -->
+<!--     ) %>% -->
+<!--     dplyr::select(c("cluster","region", everything())) %>% -->
+<!--   arrange(cluster, p_val) -> Cluster.markers -->
+
+<!--   dir.create(file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType),recursive = T) -->
+
+<!--   dm <- Cluster.markers %>% -->
+<!--     mutate(GeneCardLink = paste0(geneCardUrl, gene_name), -->
+<!--            ensemblLink = paste0(ensemblUrl, gene_id) -->
+<!--     ) -->
+
+<!--   class(dm$GeneCardLink) <- "hyperlink" -->
+<!--   class(dm$ensemblLink) <- "hyperlink" -->
+
+<!--   write.xlsx(dm, -->
+<!--              sheetName = "ContrastVsAll", -->
+<!--              file = file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"xlsx",sep=".")), -->
+<!--              firstRow = T, firstCol = T, overwrite = T -->
+<!--   ) -->
+
+<!--   Cluster.markers %>% -->
+<!--     mutate(GeneCardLink = paste0("<a href='" -->
+<!--                                  ,paste0(geneCardUrl,gene_name) -->
+<!--                                  ,"' target='_blank'>" -->
+<!--                                  , gene_name -->
+<!--                                  ,"</a>"), -->
+<!--            ensemblLink <- paste0("<a href='" -->
+<!--                                  ,paste0(ensemblUrl,gene_id) -->
+<!--                                  ,"' target='_blank'>" -->
+<!--                                  ,gene_id -->
+<!--                                  ,"</a>") -->
+<!--     ) %>% -->
+<!--     write_tsv(file = file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"tsv",sep=".")),col_names = T) -->
+
+
+<!--   saveRDS(Cluster.markers,file = file.path(outputPath,"contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"rds",sep="."))) -->
+
+<!-- } -->
+
+<!-- ``` -->
+
+<!-- ```{r } -->
+
+<!-- t <- table(Cluster.markers[Cluster.markers$p_val_adj < pval,"cluster"]) -->
+
+<!-- datatable(t(as.matrix(t)) -->
+<!--           , caption = "Cluster sig peak markers" -->
+<!--           , options = list( -->
+<!--             searching = FALSE, -->
+<!--             ordering = F, -->
+<!--             info = F, -->
+<!--             paging = F, -->
+<!--             scrollX = F -->
+<!--           ) -->
+<!--           ) -->
+
+<!-- ``` -->
+
+<!-- Get an excel file with all the results from this analysis here: [`r file.path("contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse,"xlsx",sep="."))`](`r file.path( "contrastsBtwnClusters",subsetName,contrastType,paste(contrastType,subsetName,cellSet,clustering,minPct,testUse, "xlsx",sep= "."))`) -->
