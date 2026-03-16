@@ -1,0 +1,868 @@
+---
+title: "C3 Marker Browser Montages for Selected ESC Transition Studies"
+subtitle: "Real gene models, BigWig-derived normalization, top up/down C3 peaks, average and replicate-level browser views"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+This notebook rebuilds the selected-study C3 browser figures using the BigWigs directly.
+
+Key design choices:
+
+1. Peak ranking is computed directly from normalized BigWig signal over strict `C3` marker peaks.
+2. Loci are selected programmatically as top `up` and `down` `C3` peaks for each study comparison.
+3. Real gene models are drawn with `Gviz::GeneRegionTrack` from `TxDb.Mmusculus.UCSC.mm10.knownGene`.
+4. Main figure uses replicate averages for readability.
+5. Companion plots keep all replicates.
+6. Two scaling modes are saved:
+   - `absolute_normalized`: library-size normalized signal, with panel y-limits set from the non-epiblast tracks to avoid flattening everything else
+   - `autoscaled`: each track divided by its own 99th percentile, for shape comparison only
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv")
+renv::activate()
+
+cran_pkgs <- c("tidyverse", "patchwork", "glue", "scales", "png")
+bioc_pkgs <- c(
+  "GenomicRanges", "rtracklayer", "Signac", "Gviz",
+  "TxDb.Mmusculus.UCSC.mm10.knownGene", "org.Mm.eg.db"
+)
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg, ask = FALSE, update = FALSE)
+}
+
+suppressMessages({
+  library(tidyverse)
+  library(patchwork)
+  library(glue)
+  library(scales)
+  library(png)
+  library(grid)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(Signac)
+  library(Gviz)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  library(org.Mm.eg.db)
+})
+
+set.seed(42)
+options(ucscChromosomeNames = FALSE)
+```
+
+## 2. Configuration
+
+```{r config}
+DATA_DIR <- file.path("..", "data")
+RESULTS_DIR <- file.path("..", "results")
+METADATA_FILE <- file.path("..", "ATAC_bigwig_metadata_AIannotated.csv")
+MARKER_FILE <- file.path(RESULTS_DIR, "Epiblast_clusters_marker_peaks_annotated_reg.tsv")
+
+OUT_ROOT <- file.path(RESULTS_DIR, "C3_marker_browser_montage_selected_studies")
+OUT_TABLES <- file.path(OUT_ROOT, "tables")
+OUT_LOCI <- file.path(OUT_ROOT, "locus_panels")
+OUT_FIGS <- file.path(OUT_ROOT, "figures")
+
+for (d in c(OUT_ROOT, OUT_TABLES, OUT_LOCI, OUT_FIGS)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+
+state_colors <- c("ESC" = "#4D4D4D", "EpiLC" = "#D55E00", "EpiSC" = "#007C91")
+study_track_colors <- c(
+  "E6.5 Epiblast_C3" = "#6F6258",
+  "ESC" = state_colors["ESC"],
+  "EpiLC" = state_colors["EpiLC"],
+  "EpiSC" = state_colors["EpiSC"],
+  "sEpiLC" = "#7B8CCB",
+  "d2 EpiLC" = "#F39B6D",
+  "EpiLC+CHIR" = "#66A61E",
+  "FTW" = "#D95F9A"
+)
+
+marker_log2fc_cutoff <- 0.5
+marker_padj_cutoff <- 0.05
+top_peaks_per_direction <- 3
+all_c3_chunk_size <- 6
+region_flank_factor <- 10
+region_min_flank_bp <- 6000
+bin_size_bp <- 25
+peak_highlight_fill <- "#F4D03F35"
+```
+
+## 3. Helper Functions
+
+```{r helpers}
+clean_str <- function(x) {
+  x <- ifelse(is.na(x), "", x)
+  gsub("\\s+", " ", trimws(x))
+}
+
+sanitize_numeric_matrix <- function(mat) {
+  mat <- as.matrix(mat)
+  storage.mode(mat) <- "double"
+  mat[!is.finite(mat)] <- NA_real_
+  mat
+}
+
+compute_size_factors <- function(mat) {
+  mat <- sanitize_numeric_matrix(mat)
+  sample_medians <- apply(mat, 1, function(x) median(x[is.finite(x)], na.rm = TRUE))
+  pos <- sample_medians[is.finite(sample_medians) & sample_medians > 0]
+  gm <- median(pos, na.rm = TRUE)
+  if (!is.finite(gm) || gm <= 0) gm <- 1
+  sf <- sample_medians / gm
+  sf[!is.finite(sf) | sf <= 0] <- 1
+  names(sf) <- rownames(mat)
+  sf
+}
+
+extract_primary_gene <- function(x) {
+  xs <- strsplit(ifelse(is.na(x), "", x), "[,;|/ ]+")
+  vapply(xs, function(y) {
+    y <- y[nzchar(y)]
+    if (length(y) == 0) NA_character_ else y[1]
+  }, character(1))
+}
+
+bw_mean_over_ranges <- function(bw_path, gr) {
+  cov <- rtracklayer::import(bw_path, format = "BigWig", which = gr, as = "RleList")
+  vals <- rep(NA_real_, length(gr))
+  gr_chr <- as.character(seqnames(gr))
+  cov_chr <- names(cov)
+
+  mapped <- dplyr::case_when(
+    gr_chr %in% cov_chr ~ gr_chr,
+    paste0("chr", gr_chr) %in% cov_chr ~ paste0("chr", gr_chr),
+    sub("^chr", "", gr_chr) %in% cov_chr ~ sub("^chr", "", gr_chr),
+    TRUE ~ NA_character_
+  )
+
+  valid_idx <- which(!is.na(mapped))
+  if (length(valid_idx) > 0) {
+    by_chr <- split(valid_idx, mapped[valid_idx])
+    for (chr in names(by_chr)) {
+      idx <- by_chr[[chr]]
+      v <- Views(cov[[chr]], start = start(gr[idx]), end = end(gr[idx]))
+      vals[idx] <- viewMeans(v, na.rm = TRUE)
+    }
+  }
+
+  vals[is.na(vals)] <- 0
+  vals
+}
+
+extract_region_signal <- function(bw_path, seq_chr, start_bp, end_bp) {
+  gr <- GRanges(seqnames = seq_chr, ranges = IRanges(start = start_bp, end = end_bp))
+  cov <- rtracklayer::import(bw_path, format = "BigWig", which = gr, as = "RleList")
+  cov_chr <- names(cov)
+  mapped_chr <- dplyr::case_when(
+    seq_chr %in% cov_chr ~ seq_chr,
+    paste0("chr", seq_chr) %in% cov_chr ~ paste0("chr", seq_chr),
+    sub("^chr", "", seq_chr) %in% cov_chr ~ sub("^chr", "", seq_chr),
+    TRUE ~ NA_character_
+  )
+  if (is.na(mapped_chr)) return(rep(NA_real_, end_bp - start_bp + 1))
+  as.numeric(cov[[mapped_chr]][start_bp:end_bp])
+}
+
+bin_signal <- function(signal_vec, chr, from_bp, bin_size = 25) {
+  idx <- seq_along(signal_vec)
+  bins <- split(idx, ceiling(idx / bin_size))
+  tibble(
+    seqnames = chr,
+    start = from_bp + vapply(bins, min, integer(1)) - 1L,
+    end = from_bp + vapply(bins, max, integer(1)) - 1L,
+    signal = vapply(bins, function(ii) mean(signal_vec[ii], na.rm = TRUE), numeric(1))
+  )
+}
+
+make_image_plot <- function(img_path) {
+  patchwork::wrap_elements(
+    full = grid::rasterGrob(png::readPNG(img_path), interpolate = TRUE)
+  )
+}
+
+distinct_primary_gene <- function(df) {
+  df %>%
+    mutate(primary_gene = ifelse(is.na(primary_gene) | primary_gene == "", region, primary_gene)) %>%
+    group_by(primary_gene) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+}
+
+render_locus_gviz <- function(
+  peak_row,
+  track_specs,
+  scaling_mode = c("absolute_normalized", "autoscaled"),
+  out_png,
+  title_prefix,
+  compact = FALSE
+) {
+  scaling_mode <- match.arg(scaling_mode)
+
+  peak_gr <- Signac::StringToGRanges(peak_row$region, sep = c("-", "-"))
+  chr <- as.character(seqnames(peak_gr))[1]
+  pk_start <- start(peak_gr)[1]
+  pk_end <- end(peak_gr)[1]
+  pk_width <- width(peak_gr)[1]
+  flank <- max(region_min_flank_bp, region_flank_factor * pk_width)
+  from_bp <- max(1, pk_start - flank)
+  to_bp <- pk_end + flank
+
+  sig_list <- list()
+  for (i in seq_len(nrow(track_specs))) {
+    bw_vecs <- lapply(seq_along(track_specs$bw_paths[[i]]), function(j) {
+      sid <- track_specs$sample_id[[i]][j]
+      sf <- track_specs$size_factor[[i]][j]
+      raw <- extract_region_signal(track_specs$bw_paths[[i]][j], chr, from_bp, to_bp)
+      raw / sf
+    })
+    sig_mat <- do.call(rbind, bw_vecs)
+    if (track_specs$aggregate_mode[i] == "mean") {
+      sig <- colMeans(sig_mat, na.rm = TRUE)
+    } else {
+      sig <- sig_mat[1, ]
+    }
+    sig_list[[track_specs$track_name[i]]] <- sig
+  }
+
+  if (scaling_mode == "autoscaled") {
+    sig_list <- lapply(sig_list, function(x) {
+      qv <- quantile(x, probs = 0.99, na.rm = TRUE)
+      if (!is.finite(qv) || qv <= 0) qv <- max(x, na.rm = TRUE)
+      if (!is.finite(qv) || qv <= 0) qv <- 1
+      x / qv
+    })
+    ylim_top <- 1.05
+  } else {
+    non_epi_names <- setdiff(names(sig_list), "E6.5 Epiblast_C3")
+    ref_vals <- unlist(sig_list[non_epi_names], use.names = FALSE)
+    if (length(ref_vals) == 0) ref_vals <- unlist(sig_list, use.names = FALSE)
+    ylim_top <- quantile(ref_vals, probs = 0.995, na.rm = TRUE)
+    if (!is.finite(ylim_top) || ylim_top <= 0) {
+      ylim_top <- max(ref_vals, na.rm = TRUE)
+    }
+    if (!is.finite(ylim_top) || ylim_top <= 0) ylim_top <- 1
+  }
+
+  gene_track <- GeneRegionTrack(
+    txdb,
+    chromosome = chr,
+    start = from_bp,
+    end = to_bp,
+    transcriptAnnotation = "symbol",
+    collapseTranscripts = "meta",
+    background.title = "white",
+    name = "Genes"
+  )
+
+  axis_track <- GenomeAxisTrack(name = "")
+
+  peak_track <- AnnotationTrack(
+    start = pk_start,
+    end = pk_end,
+    chromosome = chr,
+    genome = "mm10",
+    name = "Peak",
+    fill = "#D95F02",
+    col = "#D95F02"
+  )
+
+  displayPars(gene_track) <- list(
+    background.title = "white",
+    background.panel = "white",
+    col.title = "black",
+    col.axis = "black",
+    cex.title = 0.9,
+    fontsize = 11,
+    fill = "#24478f",
+    col = "#24478f",
+    just.group = "above"
+  )
+  displayPars(axis_track) <- list(background.title = "white", background.panel = "white", cex = 0.7)
+  displayPars(peak_track) <- list(background.title = "white", background.panel = "white", cex.title = 0.8)
+
+  data_tracks <- list()
+  for (nm in names(sig_list)) {
+    this_color <- track_specs$track_color[match(nm, track_specs$track_name)]
+    if (length(this_color) == 0 || is.na(this_color)) this_color <- "#4D4D4D"
+    binned <- bin_signal(sig_list[[nm]], chr, from_bp, bin_size = bin_size_bp)
+    gr <- GRanges(seqnames = binned$seqnames, ranges = IRanges(start = binned$start, end = binned$end))
+    tr <- DataTrack(
+      range = gr,
+      data = matrix(binned$signal, nrow = 1),
+      genome = "mm10",
+      chromosome = chr,
+      type = "histogram",
+      baseline = 0,
+      name = nm
+    )
+    displayPars(tr) <- list(
+      ylim = c(0, ylim_top),
+      background.title = "white",
+      background.panel = "white",
+      col.axis = "black",
+      col.title = "black",
+      cex.axis = 0.75,
+      cex.title = 0.82,
+      lwd = 0.8,
+      fill = this_color,
+      col.histogram = this_color,
+      col = this_color
+    )
+    data_tracks[[length(data_tracks) + 1]] <- tr
+  }
+
+  hl <- HighlightTrack(
+    trackList = c(list(axis_track, gene_track, peak_track), data_tracks),
+    start = pk_start,
+    end = pk_end,
+    chromosome = chr,
+    fill = peak_highlight_fill,
+    col = NA,
+    inBackground = TRUE
+  )
+
+  if (compact) {
+    track_sizes <- c(0.22, 0.55, 0.20, rep(0.68, length(data_tracks)))
+    plot_height <- max(620, 170 + 105 * length(data_tracks))
+  } else {
+    track_sizes <- c(0.35, 0.90, 0.35, rep(1.0, length(data_tracks)))
+    plot_height <- max(900, 260 + 180 * length(data_tracks))
+  }
+
+  png(out_png, width = 1800, height = plot_height, res = 200)
+  plotTracks(
+    hl,
+    from = from_bp,
+    to = to_bp,
+    sizes = track_sizes,
+    transcriptAnnotation = "symbol",
+    background.panel = "white",
+    background.title = "white",
+    col.axis = "black",
+    cex.title = ifelse(compact, 0.68, 0.8),
+    main = glue("{title_prefix} | {peak_row$primary_gene} | {peak_row$region}")
+  )
+  dev.off()
+}
+
+make_track_specs <- function(study_meta, epiblast_meta, def, size_factor_tbl, mode = c("average", "replicates")) {
+  mode <- match.arg(mode)
+
+  if (mode == "average") {
+    out <- list(
+      tibble(
+        track_name = "E6.5 Epiblast_C3",
+        track_color = unname(study_track_colors["E6.5 Epiblast_C3"]),
+        bw_paths = list(epiblast_meta$bw_path),
+        sample_id = list(epiblast_meta$sample_id),
+        size_factor = list(size_factor_tbl$size_factor[match(epiblast_meta$sample_id, size_factor_tbl$sample_id)]),
+        aggregate_mode = "mean"
+      )
+    )
+
+    for (grp in def$group_order) {
+      samp <- study_meta %>% filter(sample_group == grp)
+      out[[length(out) + 1]] <- tibble(
+        track_name = grp,
+        track_color = unname(study_track_colors[grp]),
+        bw_paths = list(samp$bw_path),
+        sample_id = list(samp$sample_id),
+        size_factor = list(size_factor_tbl$size_factor[match(samp$sample_id, size_factor_tbl$sample_id)]),
+        aggregate_mode = "mean"
+      )
+    }
+    bind_rows(out)
+  } else {
+    epi_row <- tibble(
+      track_name = "E6.5 Epiblast_C3",
+      track_color = unname(study_track_colors["E6.5 Epiblast_C3"]),
+      bw_paths = list(epiblast_meta$bw_path),
+      sample_id = list(epiblast_meta$sample_id),
+      size_factor = list(size_factor_tbl$size_factor[match(epiblast_meta$sample_id, size_factor_tbl$sample_id)]),
+      aggregate_mode = "single"
+    )
+
+    rep_rows <- study_meta %>%
+      mutate(track_name = sample_title, track_color = unname(study_track_colors[sample_group])) %>%
+      transmute(
+        track_name,
+        track_color,
+        bw_paths = purrr::map(bw_path, ~.x),
+        sample_id = purrr::map(sample_id, ~.x),
+        size_factor = purrr::map(sample_id, ~size_factor_tbl$size_factor[match(.x, size_factor_tbl$sample_id)]),
+        aggregate_mode = "single"
+      )
+
+    bind_rows(epi_row, rep_rows)
+  }
+}
+
+assemble_montage <- function(img_paths, title_text, subtitle_text, ncol = 3) {
+  if (length(img_paths) == 0) return(NULL)
+  patchwork::wrap_plots(lapply(img_paths, make_image_plot), ncol = ncol) +
+    plot_annotation(title = title_text, subtitle = subtitle_text)
+}
+```
+
+## 4. Load Metadata and Marker Peaks
+
+```{r load-data}
+meta <- readr::read_delim(METADATA_FILE, delim = ";", show_col_types = FALSE) %>%
+  mutate(
+    sample_id = ifelse(is.na(basename) | basename == "", sub("[.]bw$", "", filename), basename),
+    sample_title = clean_str(sample_title),
+    bw_path = file.path(DATA_DIR, "ESC_other", filename),
+    bw_exists = file.exists(bw_path)
+  )
+
+marker_tbl_all <- read.delim(MARKER_FILE, sep = "\t", stringsAsFactors = FALSE) %>%
+  filter(avg_log2FC > marker_log2fc_cutoff, p_val_adj < marker_padj_cutoff) %>%
+  mutate(primary_gene = extract_primary_gene(closest_TSS))
+
+marker_tbl_c3 <- marker_tbl_all %>%
+  filter(cluster == "C3")
+
+all_marker_gr <- Signac::StringToGRanges(marker_tbl_all$region, sep = c("-", "-"))
+c3_marker_gr <- Signac::StringToGRanges(marker_tbl_c3$region, sep = c("-", "-"))
+
+epiblast_meta <- tibble(
+  sample_id = "Sendra_C3",
+  sample_title = "E6.5 Epiblast_C3",
+  bw_path = file.path(DATA_DIR, "Epiblast", "Sendra_C3.bw"),
+  bw_exists = file.exists(bw_path)
+) %>%
+  filter(bw_exists)
+
+study_definitions <- list(
+  "PRJNA648362" = list(
+    study_title = "PRJNA648362 | ESC -> EpiLC -> EpiSC",
+    comparison_a = "EpiSC",
+    comparison_b = "ESC",
+    group_order = c("ESC", "EpiLC", "EpiSC"),
+    sample_map = c(
+      "ATAC_ESC_rep1" = "ESC",
+      "ATAC_ESC_rep2" = "ESC",
+      "ATAC_EpiLC_rep1" = "EpiLC",
+      "ATAC_EpiLC_rep2" = "EpiLC",
+      "ATAC_EpiSC_rep1" = "EpiSC",
+      "ATAC_EpiSC_rep2" = "EpiSC"
+    )
+  ),
+  "PRJNA856446" = list(
+    study_title = "PRJNA856446 | sEpiLC -> d2 EpiLC -> EpiLC+CHIR -> FTW",
+    comparison_a = "FTW",
+    comparison_b = "sEpiLC",
+    group_order = c("sEpiLC", "d2 EpiLC", "EpiLC+CHIR", "FTW"),
+    sample_map = c(
+      "sEpiLC_1" = "sEpiLC",
+      "sEpiLC_2" = "sEpiLC",
+      "d2 EpiLC_1" = "d2 EpiLC",
+      "d2 EpiLC_2" = "d2 EpiLC",
+      "EpiLC+CHIR_1" = "EpiLC+CHIR",
+      "EpiLC+CHIR_2" = "EpiLC+CHIR",
+      "FTW_1" = "FTW",
+      "FTW_2" = "FTW"
+    )
+  )
+)
+
+study_meta_list <- lapply(names(study_definitions), function(study_id) {
+  def <- study_definitions[[study_id]]
+  meta %>%
+    filter(study_accession == study_id, bw_exists, sample_title %in% names(def$sample_map)) %>%
+    mutate(sample_group = unname(def$sample_map[sample_title])) %>%
+    arrange(factor(sample_group, levels = def$group_order), sample_title)
+})
+names(study_meta_list) <- names(study_definitions)
+
+cat("Strict markers all clusters:", nrow(marker_tbl_all), "\n")
+cat("Strict C3 markers:", nrow(marker_tbl_c3), "\n")
+```
+
+## 5. Direct BigWig-Derived Normalization
+
+```{r normalization, message=FALSE, warning=FALSE}
+all_selected_samples <- bind_rows(study_meta_list) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+sample_signal_rows <- list()
+for (i in seq_len(nrow(all_selected_samples))) {
+  sid <- all_selected_samples$sample_id[i]
+  bw <- all_selected_samples$bw_path[i]
+  sample_signal_rows[[sid]] <- bw_mean_over_ranges(bw, all_marker_gr)
+}
+
+epiblast_all_marker <- bw_mean_over_ranges(epiblast_meta$bw_path[1], all_marker_gr)
+
+norm_mat <- do.call(rbind, c(sample_signal_rows, list(Sendra_C3 = epiblast_all_marker)))
+rownames(norm_mat) <- c(all_selected_samples$sample_id, "Sendra_C3")
+colnames(norm_mat) <- marker_tbl_all$region
+
+size_factor <- compute_size_factors(norm_mat)
+size_factor_tbl <- tibble(sample_id = names(size_factor), size_factor = unname(size_factor))
+readr::write_csv(size_factor_tbl, file.path(OUT_TABLES, "bigwig_direct_size_factors_selected_studies.csv"))
+```
+
+## 6. Rank C3 Peaks Per Study
+
+```{r rank-peaks, message=FALSE, warning=FALSE}
+c3_signal_rows <- list()
+all_rank_rows <- list()
+all_selected_rows <- list()
+
+for (study_id in names(study_definitions)) {
+  def <- study_definitions[[study_id]]
+  sm <- study_meta_list[[study_id]]
+  peak_cols <- marker_tbl_c3$region
+
+  sample_peak_means <- lapply(seq_len(nrow(sm)), function(i) {
+    sid <- sm$sample_id[i]
+    sf <- size_factor_tbl$size_factor[match(sid, size_factor_tbl$sample_id)]
+    vals <- bw_mean_over_ranges(sm$bw_path[i], c3_marker_gr) / sf
+    names(vals) <- peak_cols
+    tibble(
+      sample_id = sid,
+      sample_title = sm$sample_title[i],
+      sample_group = sm$sample_group[i]
+    ) %>%
+      bind_cols(as_tibble_row(as.list(vals)))
+  })
+
+  sample_peak_df <- bind_rows(sample_peak_means)
+  peak_cols <- marker_tbl_c3$region
+
+  mean_by_group <- sample_peak_df %>%
+    group_by(sample_group) %>%
+    summarise(across(all_of(peak_cols), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+  vec_a <- as.numeric(mean_by_group[mean_by_group$sample_group == def$comparison_a, peak_cols, drop = TRUE])
+  vec_b <- as.numeric(mean_by_group[mean_by_group$sample_group == def$comparison_b, peak_cols, drop = TRUE])
+
+  rank_tbl <- marker_tbl_c3 %>%
+    transmute(
+      study_accession = study_id,
+      primary_gene,
+      region,
+      avg_log2FC_marker = avg_log2FC,
+      marker_padj = p_val_adj,
+      mean_group_a = vec_a,
+      mean_group_b = vec_b,
+      log2FC_groupA_vs_groupB = log2((vec_a + 1e-3) / (vec_b + 1e-3)),
+      delta_groupA_minus_groupB = vec_a - vec_b,
+      higher_accessibility_condition = ifelse(log2FC_groupA_vs_groupB >= 0, def$comparison_a, def$comparison_b),
+      lower_accessibility_condition = ifelse(log2FC_groupA_vs_groupB >= 0, def$comparison_b, def$comparison_a)
+    ) %>%
+    arrange(desc(log2FC_groupA_vs_groupB))
+
+  readr::write_csv(rank_tbl, file.path(OUT_TABLES, paste0(study_id, "_ranked_C3_peaks.csv")))
+  all_rank_rows[[study_id]] <- rank_tbl
+
+  selected_up <- rank_tbl %>%
+    filter(log2FC_groupA_vs_groupB > 0) %>%
+    arrange(desc(log2FC_groupA_vs_groupB), desc(mean_group_a)) %>%
+    distinct_primary_gene() %>%
+    slice_head(n = top_peaks_per_direction) %>%
+    mutate(direction_class = "up")
+
+  selected_down <- rank_tbl %>%
+    filter(log2FC_groupA_vs_groupB < 0) %>%
+    arrange(log2FC_groupA_vs_groupB, desc(mean_group_b)) %>%
+    distinct_primary_gene() %>%
+    slice_head(n = top_peaks_per_direction) %>%
+    mutate(direction_class = "down")
+
+  selected_tbl <- bind_rows(selected_up, selected_down) %>%
+    mutate(
+      study_title = def$study_title,
+      comparison_label = paste0(def$comparison_a, " vs ", def$comparison_b)
+    )
+
+  readr::write_csv(selected_tbl, file.path(OUT_TABLES, paste0(study_id, "_selected_top_C3_peaks.csv")))
+  all_selected_rows[[study_id]] <- selected_tbl
+}
+
+ranked_tbl_all <- bind_rows(all_rank_rows)
+selected_tbl_all <- bind_rows(all_selected_rows)
+
+readr::write_csv(ranked_tbl_all, file.path(OUT_TABLES, "all_selected_studies_ranked_C3_peaks.csv"))
+readr::write_csv(selected_tbl_all, file.path(OUT_TABLES, "all_selected_studies_top_C3_peaks.csv"))
+
+selected_tbl_all
+```
+
+## 7. Render Real Browser Panels Per Locus
+
+```{r render-locus-panels, message=FALSE, warning=FALSE}
+render_manifest_rows <- list()
+
+for (study_id in names(study_definitions)) {
+  def <- study_definitions[[study_id]]
+  sm <- study_meta_list[[study_id]]
+  sel_tbl <- all_selected_rows[[study_id]]
+
+  avg_specs <- make_track_specs(sm, epiblast_meta, def, size_factor_tbl, mode = "average")
+  rep_specs <- make_track_specs(sm, epiblast_meta, def, size_factor_tbl, mode = "replicates")
+
+  study_dir <- file.path(OUT_LOCI, study_id)
+  if (!dir.exists(study_dir)) dir.create(study_dir, recursive = TRUE)
+
+  for (i in seq_len(nrow(sel_tbl))) {
+    peak_row <- sel_tbl[i, ]
+    gene_tag <- ifelse(is.na(peak_row$primary_gene) | peak_row$primary_gene == "", paste0("peak", i), peak_row$primary_gene)
+    dir_tag <- peak_row$direction_class
+    idx_tag <- sprintf("%02d", i)
+
+    avg_abs_png <- file.path(study_dir, paste0(idx_tag, "_", dir_tag, "_", gene_tag, "_average_absolute.png"))
+    avg_auto_png <- file.path(study_dir, paste0(idx_tag, "_", dir_tag, "_", gene_tag, "_average_autoscaled.png"))
+    rep_abs_png <- file.path(study_dir, paste0(idx_tag, "_", dir_tag, "_", gene_tag, "_replicates_absolute.png"))
+
+    render_locus_gviz(
+      peak_row = peak_row,
+      track_specs = avg_specs,
+      scaling_mode = "absolute_normalized",
+      out_png = avg_abs_png,
+      title_prefix = paste0(study_id, " | average")
+    )
+
+    render_locus_gviz(
+      peak_row = peak_row,
+      track_specs = avg_specs,
+      scaling_mode = "autoscaled",
+      out_png = avg_auto_png,
+      title_prefix = paste0(study_id, " | average autoscaled")
+    )
+
+    render_locus_gviz(
+      peak_row = peak_row,
+      track_specs = rep_specs,
+      scaling_mode = "absolute_normalized",
+      out_png = rep_abs_png,
+      title_prefix = paste0(study_id, " | replicates")
+    )
+
+    render_manifest_rows[[length(render_manifest_rows) + 1]] <- tibble(
+      study_accession = study_id,
+      direction_class = peak_row$direction_class,
+      primary_gene = peak_row$primary_gene,
+      region = peak_row$region,
+      average_absolute_png = avg_abs_png,
+      average_autoscaled_png = avg_auto_png,
+      replicates_absolute_png = rep_abs_png
+    )
+  }
+}
+
+render_manifest <- bind_rows(render_manifest_rows)
+readr::write_csv(render_manifest, file.path(OUT_TABLES, "render_manifest_C3_browser_panels.csv"))
+render_manifest
+```
+
+## 8. Assemble Study Montages
+
+```{r montage-assembly, fig.width=15, fig.height=10, message=FALSE, warning=FALSE}
+study_montage_rows <- list()
+
+for (study_id in names(study_definitions)) {
+  def <- study_definitions[[study_id]]
+  man <- render_manifest %>% filter(study_accession == study_id)
+  if (nrow(man) == 0) next
+
+  up_avg_abs <- man %>% filter(direction_class == "up") %>% pull(average_absolute_png)
+  down_avg_abs <- man %>% filter(direction_class == "down") %>% pull(average_absolute_png)
+  up_avg_auto <- man %>% filter(direction_class == "up") %>% pull(average_autoscaled_png)
+  down_avg_auto <- man %>% filter(direction_class == "down") %>% pull(average_autoscaled_png)
+
+  abs_plot <- (
+    assemble_montage(
+      up_avg_abs,
+      title_text = paste0("More accessible in ", def$comparison_a, " vs ", def$comparison_b),
+      subtitle_text = "Replicate-average tracks, library-size normalized"
+    ) /
+    assemble_montage(
+      down_avg_abs,
+      title_text = paste0("Less accessible in ", def$comparison_a, " vs ", def$comparison_b),
+      subtitle_text = "Replicate-average tracks, library-size normalized"
+    )
+  ) + plot_annotation(
+    title = def$study_title,
+    subtitle = "Peak ranking and normalization derived directly from the BigWigs | y-limits set from non-epiblast tracks to avoid epiblast flattening"
+  )
+
+  auto_plot <- (
+    assemble_montage(
+      up_avg_auto,
+      title_text = paste0("More accessible in ", def$comparison_a, " vs ", def$comparison_b),
+      subtitle_text = "Replicate-average tracks, per-track autoscaled to the 99th percentile"
+    ) /
+    assemble_montage(
+      down_avg_auto,
+      title_text = paste0("Less accessible in ", def$comparison_a, " vs ", def$comparison_b),
+      subtitle_text = "Replicate-average tracks, per-track autoscaled to the 99th percentile"
+    )
+  ) + plot_annotation(
+    title = paste0(def$study_title, " | autoscaled"),
+    subtitle = "Shape-comparison view only; amplitudes should not be interpreted quantitatively"
+  )
+
+  abs_png <- file.path(OUT_FIGS, paste0(study_id, "_C3_top_up_down_average_absolute.png"))
+  auto_png <- file.path(OUT_FIGS, paste0(study_id, "_C3_top_up_down_average_autoscaled.png"))
+
+  ggsave(abs_png, abs_plot, width = 15, height = 10, dpi = 450)
+  ggsave(auto_png, auto_plot, width = 15, height = 10, dpi = 450)
+
+  study_montage_rows[[length(study_montage_rows) + 1]] <- tibble(
+    study_accession = study_id,
+    study_title = def$study_title,
+    average_absolute_png = abs_png,
+    average_autoscaled_png = auto_png
+  )
+}
+
+study_montage_manifest <- bind_rows(study_montage_rows)
+readr::write_csv(study_montage_manifest, file.path(OUT_TABLES, "study_montage_manifest.csv"))
+study_montage_manifest
+```
+
+## 9. All C3 Peaks, Autoscaled, Grouped in Montages of Six
+
+```{r all-c3-autoscaled-compact, message=FALSE, warning=FALSE}
+all_c3_rows <- list()
+
+for (study_id in names(study_definitions)) {
+  def <- study_definitions[[study_id]]
+  sm <- study_meta_list[[study_id]]
+  avg_specs <- make_track_specs(sm, epiblast_meta, def, size_factor_tbl, mode = "average")
+  rank_tbl <- all_rank_rows[[study_id]] %>%
+    arrange(desc(log2FC_groupA_vs_groupB), desc(abs(delta_groupA_minus_groupB))) %>%
+    mutate(order_idx = row_number())
+
+  compact_dir <- file.path(OUT_LOCI, study_id, "all_c3_autoscaled_compact")
+  if (!dir.exists(compact_dir)) dir.create(compact_dir, recursive = TRUE)
+
+  compact_paths <- character(nrow(rank_tbl))
+  for (i in seq_len(nrow(rank_tbl))) {
+    peak_row <- rank_tbl[i, ]
+    gene_tag <- ifelse(is.na(peak_row$primary_gene) | peak_row$primary_gene == "", paste0("peak", i), peak_row$primary_gene)
+    compact_paths[i] <- out_png
+    if (!file.exists(out_png)) {
+      render_locus_gviz(
+        peak_row = peak_row,
+        track_specs = avg_specs,
+        scaling_mode = "autoscaled",
+        out_png = out_png,
+        title_prefix = paste0(study_id, " | compact autoscaled"),
+        compact = TRUE
+      )
+    }
+  }
+
+  chunks <- split(compact_paths, ceiling(seq_along(compact_paths) / all_c3_chunk_size))
+  for (page_idx in seq_along(chunks)) {
+    montage_plot <- assemble_montage(
+      chunks[[page_idx]],
+      title_text = paste0(def$study_title, " | all strict C3 peaks | autoscaled"),
+      subtitle_text = paste0(
+        "Page ", page_idx, " of ", length(chunks),
+        " | loci ordered by ", def$comparison_a, " vs ", def$comparison_b, " log2FC"
+      ),
+      ncol = 3
+    )
+    montage_png <- file.path(OUT_FIGS, paste0(study_id, "_all_C3_autoscaled_page_", sprintf("%02d", page_idx), ".png"))
+    montage_svg <- file.path(OUT_FIGS, paste0(study_id, "_all_C3_autoscaled_page_", sprintf("%02d", page_idx), ".svg"))
+
+    if (!file.exists(montage_png)) {
+      ggsave(montage_png, montage_plot, width = 15, height = 9, dpi = 350)
+    }
+
+    if (!file.exists(montage_svg)) {
+      ggsave(montage_svg, montage_plot, width = 15, height = 9)
+    }
+
+    all_c3_rows[[length(all_c3_rows) + 1]] <- tibble(
+      study_accession = study_id,
+      study_title = def$study_title,
+      page = page_idx,
+      n_pages = length(chunks),
+      montage_png = montage_png
+    )
+  }
+}
+
+all_c3_montage_manifest <- bind_rows(all_c3_rows)
+readr::write_csv(all_c3_montage_manifest, file.path(OUT_TABLES, "all_C3_autoscaled_compact_montage_manifest.csv"))
+all_c3_montage_manifest
+```
+
+## 10. All C3 Peak Montages in Report
+
+```{r all-c3-in-report, results='asis', echo=FALSE}
+for (study_id in names(study_definitions)) {
+  def <- study_definitions[[study_id]]
+  sub_man <- all_c3_montage_manifest %>% filter(study_accession == study_id)
+  cat("\n\n### ", def$study_title, " | all strict C3 peaks autoscaled\n\n", sep = "")
+  for (i in seq_len(nrow(sub_man))) {
+    cat("#### Montage page ", sub_man$page[i], " / ", sub_man$n_pages[i], "\n\n", sep = "")
+    print(knitr::include_graphics(sub_man$montage_png[i]))
+    cat("\n\n")
+  }
+}
+```
+
+## 11. Notes on Interpretation
+
+```{r notes}
+cat(
+  paste(
+    "- Main study figures use replicate averages because that is the clearest way to compare trajectory-level accessibility without overloading the panel.",
+    "- Replicate-level browser plots are still saved for every selected locus in the locus_panels directory.",
+    "- Real gene models come from Gviz + TxDb.Mmusculus.UCSC.mm10.knownGene.",
+    "- Absolute normalized plots preserve between-group amplitude after size-factor normalization from the BigWigs.",
+    "- Autoscaled plots divide each displayed track by its own 99th percentile and are meant only for shape comparison.",
+    sep = "\n"
+  )
+)
+```
+
+## 12. Outputs
+
+```{r outputs}
+cat("Tables:\n")
+cat("-", file.path(OUT_TABLES, "bigwig_direct_size_factors_selected_studies.csv"), "\n")
+cat("-", file.path(OUT_TABLES, "all_selected_studies_ranked_C3_peaks.csv"), "\n")
+cat("-", file.path(OUT_TABLES, "all_selected_studies_top_C3_peaks.csv"), "\n")
+cat("-", file.path(OUT_TABLES, "render_manifest_C3_browser_panels.csv"), "\n")
+cat("-", file.path(OUT_TABLES, "study_montage_manifest.csv"), "\n\n")
+cat("-", file.path(OUT_TABLES, "all_C3_autoscaled_compact_montage_manifest.csv"), "\n\n")
+
+cat("Study montages:\n")
+cat("-", file.path(OUT_FIGS, "PRJNA648362_C3_top_up_down_average_absolute.png"), "\n")
+cat("-", file.path(OUT_FIGS, "PRJNA648362_C3_top_up_down_average_autoscaled.png"), "\n")
+cat("-", file.path(OUT_FIGS, "PRJNA856446_C3_top_up_down_average_absolute.png"), "\n")
+cat("-", file.path(OUT_FIGS, "PRJNA856446_C3_top_up_down_average_autoscaled.png"), "\n\n")
+cat("All C3 compact autoscaled montages:\n")
+cat("-", OUT_FIGS, "\n\n")
+
+cat("Per-locus panels:\n")
+cat("-", OUT_LOCI, "\n")
+```
+
+## 13. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,1452 @@
+---
+title: "WT Steady-State and Study-Wise Epiblast Marker Meta-Analysis"
+subtitle: "Curated steady-state selection + title-based state parsing + peak-level directional statistics + browser-like tracks"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+editor_options:
+  chunk_output_type: inline
+---
+
+This notebook implements two modules:
+
+1. WT steady-state only analysis (`ESC`, `EpiLC`, `EpiSC`) selected from the curated `steady_state` metadata column, with state labels inferred from `experiment_title + sample_title`.
+2. Study-wise (`study_accession`) meta-analysis with design inference (WT vs mutant, treatment vs control, time-course), peak-level directionality, and browser-style locus plots.
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv")
+renv::activate()
+
+cran_pkgs <- c(
+  "tidyverse", "magrittr", "ggplot2", "patchwork", "scales", "rstatix",
+  "matrixStats", "ggrepel", "glue", "stringr", "ggbeeswarm"
+)
+bioc_pkgs <- c(
+  "GenomicRanges", "rtracklayer", "Signac", "ChIPpeakAnno", "Gviz",
+  "TxDb.Mmusculus.UCSC.mm10.knownGene", "org.Mm.eg.db"
+)
+
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg, ask = FALSE, update = FALSE)
+}
+
+suppressMessages({
+  library(tidyverse)
+  library(magrittr)
+  library(GenomicRanges)
+  library(rtracklayer)
+  library(Signac)
+  library(ChIPpeakAnno)
+  library(Gviz)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  library(org.Mm.eg.db)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(rstatix)
+  library(matrixStats)
+  library(ggrepel)
+  library(glue)
+  library(stringr)
+  library(ggbeeswarm)
+})
+
+set.seed(42)
+```
+
+## 2. Configuration
+
+```{r config}
+DATA_DIR <- file.path("..", "data")
+RESULTS_DIR <- file.path("..", "results")
+FIGURES_DIR <- file.path("..", "figures")
+METADATA_FILE <- file.path("..", "ATAC_bigwig_metadata_AIannotated.csv")
+MARKER_RAW_FILE <- file.path(RESULTS_DIR, "Epiblast_clusters_marker_peaks_annotated_reg.tsv")
+
+OUT_ROOT <- file.path(RESULTS_DIR, "WT_text_steady_and_studywise_meta")
+OUT_QC <- file.path(OUT_ROOT, "qc")
+OUT_PCA <- file.path(OUT_ROOT, "pca_steady")
+OUT_STUDY <- file.path(OUT_ROOT, "studywise")
+OUT_STUDY_TABLES <- file.path(OUT_STUDY, "tables")
+OUT_STUDY_PLOTS <- file.path(OUT_STUDY, "plots")
+OUT_BROWSER <- file.path(OUT_STUDY, "browser_tracks")
+OUT_STEADY_COV <- file.path(OUT_ROOT, "steady_covprofiles")
+OUT_LIT <- file.path(OUT_ROOT, "literature")
+
+for (d in c(OUT_ROOT, OUT_QC, OUT_PCA, OUT_STUDY, OUT_STUDY_TABLES, OUT_STUDY_PLOTS, OUT_BROWSER, OUT_STEADY_COV, OUT_LIT)) {
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+}
+
+marker_log2fc_cutoff <- 0.5
+marker_padj_cutoff <- 0.05
+half_width_bp <- 250
+profile_window_bp <- 2000
+fdr_cutoff <- 0.05
+min_abs_log2fc <- 0.20
+min_group_n <- 2
+min_timepoints <- 3
+max_browser_analyses <- 8
+browser_peaks_per_analysis <- 2
+browser_window_bp <- 6000
+
+state_colors <- c("ESC" = "#4D4D4D", "EpiLC" = "#D55E00", "EpiSC" = "#007C91")
+cluster_colors <- c("C1" = "#3F84AA", "C2" = "#DABE99", "C3" = "#65A83E", "C4" = "#F397C0")
+reference_state_colors <- c(
+  "Epiblast_C2" = unname(cluster_colors["C2"]),
+  "Epiblast_C3" = unname(cluster_colors["C3"]),
+  "Epiblast_C4" = unname(cluster_colors["C4"])
+)
+steady_plot_colors <- c(state_colors, reference_state_colors)
+epiblast_reference_files <- c(
+  "Epiblast_C2" = file.path(DATA_DIR, "Epiblast", "Sendra_C2.bw"),
+  "Epiblast_C3" = file.path(DATA_DIR, "Epiblast", "Sendra_C3.bw"),
+  "Epiblast_C4" = file.path(DATA_DIR, "Epiblast", "Sendra_C4.bw")
+)
+
+theme_pub <- function() {
+  theme_classic(base_size = 12) +
+    theme(
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      strip.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold")
+    )
+}
+```
+
+## 3. Helper Functions
+
+```{r helpers}
+clean_str <- function(x) {
+  x <- ifelse(is.na(x), "", x)
+  gsub("\\s+", " ", trimws(x))
+}
+
+parse_bool_flag <- function(x) {
+  x <- tolower(clean_str(as.character(x)))
+  dplyr::case_when(
+    x %in% c("true", "t", "yes", "y", "1") ~ TRUE,
+    x %in% c("false", "f", "no", "n", "0", "") ~ FALSE,
+    TRUE ~ FALSE
+  )
+}
+
+sanitize_numeric_matrix <- function(mat) {
+  mat <- as.matrix(mat)
+  storage.mode(mat) <- "double"
+  mat[!is.finite(mat)] <- NA_real_
+  mat
+}
+
+compute_size_factors <- function(mat) {
+  mat <- sanitize_numeric_matrix(mat)
+  sample_medians <- matrixStats::rowMedians(mat, na.rm = TRUE)
+  pos <- sample_medians[is.finite(sample_medians) & sample_medians > 0]
+  gm <- median(pos, na.rm = TRUE)
+  if (!is.finite(gm) || gm <= 0) gm <- 1
+  raw_sf <- sample_medians / gm
+  bad <- !is.finite(raw_sf) | raw_sf <= 0
+  sf <- raw_sf
+  sf[bad] <- 1
+  names(sf) <- rownames(mat)
+  list(sample_medians = sample_medians, size_factor = sf, bad = bad, global_median = gm)
+}
+
+parse_first_gene <- function(x) {
+  y <- strsplit(ifelse(is.na(x), "", x), "[,;|/ ]+")
+  vapply(y, function(xx) {
+    xx <- xx[nzchar(xx)]
+    if (length(xx) == 0) NA_character_ else xx[1]
+  }, character(1))
+}
+
+make_center_window <- function(gr, half_width = 250) {
+  centers <- start(gr) + floor(width(gr) / 2)
+  out <- GRanges(seqnames = seqnames(gr), ranges = IRanges(start = centers - half_width, end = centers + half_width), strand = strand(gr))
+  mcols(out) <- mcols(gr)
+  out
+}
+
+make_profile_window <- function(gr, window_bp = 2000) {
+  centers <- start(gr) + floor(width(gr) / 2)
+  out <- GRanges(seqnames = seqnames(gr), ranges = IRanges(start = centers - window_bp, end = centers + window_bp), strand = strand(gr))
+  mcols(out) <- mcols(gr)
+  out
+}
+
+bw_mean_over_ranges <- function(bw_path, gr) {
+  cov <- rtracklayer::import(bw_path, format = "BigWig", which = gr, as = "RleList")
+  vals <- rep(NA_real_, length(gr))
+  gr_chr <- as.character(seqnames(gr))
+  cov_chr <- names(cov)
+
+  map_df <- tibble(gr_chr = unique(gr_chr)) %>%
+    mutate(mapped = case_when(
+      gr_chr %in% cov_chr ~ gr_chr,
+      paste0("chr", gr_chr) %in% cov_chr ~ paste0("chr", gr_chr),
+      sub("^chr", "", gr_chr) %in% cov_chr ~ sub("^chr", "", gr_chr),
+      TRUE ~ NA_character_
+    ))
+
+  mapped_all <- map_df$mapped[match(gr_chr, map_df$gr_chr)]
+  valid_idx <- which(!is.na(mapped_all))
+
+  if (length(valid_idx) > 0) {
+    idx_by_chr <- split(valid_idx, mapped_all[valid_idx])
+    for (chr in names(idx_by_chr)) {
+      idx <- idx_by_chr[[chr]]
+      v <- Views(cov[[chr]], start = start(gr[idx]), end = end(gr[idx]))
+      vals[idx] <- viewMeans(v, na.rm = TRUE)
+    }
+  }
+
+  vals[is.na(vals)] <- 0
+  vals
+}
+
+bw_mean_over_ranges_safe <- function(bw_path, gr) {
+  tryCatch(
+    { list(ok = TRUE, values = bw_mean_over_ranges(bw_path, gr), error = NA_character_) },
+    error = function(e) { list(ok = FALSE, values = rep(NA_real_, length(gr)), error = conditionMessage(e)) }
+  )
+}
+
+extract_region_signal <- function(bw_path, seq_chr, start_bp, end_bp) {
+  gr <- GRanges(seqnames = seq_chr, ranges = IRanges(start = start_bp, end = end_bp))
+  cov <- rtracklayer::import(bw_path, format = "BigWig", which = gr, as = "RleList")
+  cov_chr <- names(cov)
+  mapped_chr <- dplyr::case_when(
+    seq_chr %in% cov_chr ~ seq_chr,
+    paste0("chr", seq_chr) %in% cov_chr ~ paste0("chr", seq_chr),
+    sub("^chr", "", seq_chr) %in% cov_chr ~ sub("^chr", "", seq_chr),
+    TRUE ~ NA_character_
+  )
+  if (is.na(mapped_chr)) return(rep(NA_real_, end_bp - start_bp + 1))
+  as.numeric(cov[[mapped_chr]][start_bp:end_bp])
+}
+
+rank_biserial <- function(x, y) {
+  x <- x[!is.na(x)]
+  y <- y[!is.na(y)]
+  if (length(x) == 0 || length(y) == 0) return(NA_real_)
+  cmp <- outer(x, y, FUN = "-")
+  wins <- sum(cmp > 0)
+  losses <- sum(cmp < 0)
+  ties <- sum(cmp == 0)
+  (2 * ((wins + 0.5 * ties) / (length(x) * length(y)))) - 1
+}
+
+parse_time_hours <- function(txt) {
+  txt <- tolower(txt)
+  # explicit hour tokens
+  h <- stringr::str_match(txt, "(\\d+(?:\\.\\d+)?)\\s*(h|hr|hrs|hour|hours)\\b")
+  if (!is.na(h[1,2])) return(as.numeric(h[1,2]))
+  # day tokens: day2, d2, day 2
+  d <- stringr::str_match(txt, "(?:\\bday\\s*|\\bd)(\\d+(?:\\.\\d+)?)\\b")
+  if (!is.na(d[1,2])) return(as.numeric(d[1,2]) * 24)
+  NA_real_
+}
+
+extract_mutant_label <- function(txt) {
+  txt <- tolower(txt)
+  labs <- c(
+    stringr::str_extract(txt, "[a-z0-9/_-]*dko[a-z0-9/_-]*"),
+    stringr::str_extract(txt, "[a-z0-9/_-]*cko[a-z0-9/_-]*"),
+    stringr::str_extract(txt, "[a-z0-9/_-]*ko[0-9a-z/_-]*"),
+    stringr::str_extract(txt, "[a-z0-9/_-]*mut[a-z0-9/_-]*")
+  )
+  labs <- labs[!is.na(labs) & nzchar(labs)]
+  if (length(labs) == 0) return(NA_character_)
+  labs[1]
+}
+
+extract_treatment_label <- function(txt) {
+  txt <- tolower(txt)
+  trt_dict <- c("dox", "nodox", "dmso", "vehicle", "chir", "bmp", "ra", "tgf", "activin", "vegf", "ifn", "serum")
+  hit <- trt_dict[stringr::str_detect(txt, paste0("\\b", trt_dict, "\\b"))]
+  if (length(hit) == 0) return(NA_character_)
+  paste(unique(hit), collapse = "+")
+}
+
+infer_state_from_text <- function(txt, ai_cell_state) {
+  t <- tolower(txt)
+  out <- dplyr::case_when(
+    stringr::str_detect(t, "\\bepisc\\b|epiblast stem") ~ "EpiSC",
+    stringr::str_detect(t, "\\bepilc\\b|epiblast-like|epiblast like") ~ "EpiLC",
+    stringr::str_detect(t, "\\besc\\b|embryonic stem") ~ "ESC",
+    TRUE ~ NA_character_
+  )
+
+  ifelse(
+    is.na(out),
+    dplyr::case_when(
+      stringr::str_detect(tolower(ai_cell_state), "episc") ~ "EpiSC",
+      stringr::str_detect(tolower(ai_cell_state), "epilc|epiblast-like") ~ "EpiLC",
+      stringr::str_detect(tolower(ai_cell_state), "esc") ~ "ESC",
+      TRUE ~ ai_cell_state
+    ),
+    out
+  )
+}
+```
+
+## 4. Load Marker Peaks and Metadata
+
+```{r load-data}
+marker_raw <- read.delim(MARKER_RAW_FILE, sep = "\t", stringsAsFactors = FALSE)
+marker_refiltered <- marker_raw %>%
+  filter(avg_log2FC > marker_log2fc_cutoff, p_val_adj < marker_padj_cutoff)
+
+meta <- readr::read_delim(METADATA_FILE, delim = ";", show_col_types = FALSE)
+optional_meta_cols <- c(
+  "ai_cell_state", "ai_diff_target", "ai_day", "ai_genotype", "ai_genes",
+  "ai_treatments", "steady_state", "perturbation", "source_database"
+)
+for (nm in setdiff(optional_meta_cols, names(meta))) {
+  meta[[nm]] <- NA_character_
+}
+
+meta <- meta %>%
+  mutate(
+    ai_cell_state = ifelse(is.na(ai_cell_state) | ai_cell_state == "", cell_state, ai_cell_state),
+    ai_cell_state = clean_str(ai_cell_state),
+    sample_title = clean_str(sample_title),
+    experiment_title = clean_str(experiment_title),
+    sample_id = ifelse(is.na(basename) | basename == "", tools::file_path_sans_ext(filename), basename),
+    bw_path = file.path(DATA_DIR, "ESC_other", filename),
+    bw_exists = file.exists(bw_path),
+    steady_state = parse_bool_flag(steady_state)
+  )
+
+cat("Marker peaks (strict filter):", nrow(marker_refiltered), "\n")
+cat("Metadata rows:", nrow(meta), "\n")
+cat("Rows with existing BigWig:", sum(meta$bw_exists), "\n")
+```
+
+## 5. Curated Steady-State Flag + Title-Based State Inference
+
+```{r steady-classification}
+gene_tokens <- meta %>%
+  transmute(tok = tolower(paste(ai_genes, ai_genotype))) %>%
+  pull(tok) %>%
+  paste(collapse = " ") %>%
+  strsplit("[^a-z0-9]+") %>%
+  unlist() %>%
+  unique()
+
+gene_tokens <- gene_tokens[nchar(gene_tokens) >= 3]
+gene_tokens <- setdiff(gene_tokens, c("wt", "esc", "episc", "epilc", "mus", "atac", "seq", "rna", "chip", "none", "na"))
+
+mut_pattern <- "(^|[^a-z])(dko|cko|ko|knockout|knock-out|mut|mutant|crispr|overexpression|oe)([^a-z]|$)|[a-z0-9]*ko[0-9a-z/_-]*"
+trt_pattern <- "dox|nodox|dmso|vehicle|chir|bmp|ra|tgf|activin|vegf|ifn|serum|inhib|treat"
+time_pattern <- "(\\d+(?:\\.\\d+)?)\\s*(h|hr|hrs|hour|hours)\\b|\\bday\\s*\\d+\\b|\\bd\\d+\\b"
+diff_pattern <- "differentiat|transition|mesoderm|endoderm|nmp|cardiac|presomitic|somite|embryoid|\\beb\\b|hemato|endothelial"
+wt_pattern <- "(^|[^a-z])(wt|wild type|wild-type)([^a-z]|$)"
+
+meta_class <- meta %>%
+  mutate(
+    sample_text = tolower(sample_title),
+    experiment_text = tolower(experiment_title),
+    text_combo = paste(experiment_text, sample_text, sep = " | "),
+    has_wt_in_sample = str_detect(sample_text, wt_pattern),
+    has_wt_in_experiment = str_detect(experiment_text, wt_pattern),
+    has_wt_keyword = has_wt_in_sample | has_wt_in_experiment,
+    # Bigwig-by-bigwig filtering: mut/treatment/time/differentiation are called from sample first.
+    has_mut_in_sample = str_detect(sample_text, mut_pattern),
+    has_mut_in_experiment = str_detect(experiment_text, mut_pattern),
+    has_mut_keyword = has_mut_in_sample | has_mut_in_experiment,
+    has_treatment_in_sample = str_detect(sample_text, trt_pattern),
+    has_treatment_in_experiment = str_detect(experiment_text, trt_pattern),
+    has_treatment_keyword = has_treatment_in_sample | has_treatment_in_experiment,
+    has_time_in_sample = str_detect(sample_text, time_pattern),
+    has_time_in_experiment = str_detect(experiment_text, time_pattern),
+    has_time_keyword = has_time_in_sample | has_time_in_experiment,
+    has_diff_in_sample = str_detect(sample_text, diff_pattern),
+    has_diff_in_experiment = str_detect(experiment_text, diff_pattern),
+    has_diff_keyword = has_diff_in_sample | has_diff_in_experiment,
+    mutant_label = vapply(text_combo, extract_mutant_label, character(1)),
+    treatment_label = vapply(text_combo, extract_treatment_label, character(1)),
+    time_hours = vapply(text_combo, parse_time_hours, numeric(1)),
+    inferred_state = infer_state_from_text(text_combo, ai_cell_state),
+    inferred_state = ifelse(inferred_state %in% c("ESC", "EpiLC", "EpiSC"), inferred_state, ai_cell_state),
+    inferred_state = ifelse(inferred_state %in% c("ESC", "EpiLC", "EpiSC"), inferred_state, NA_character_),
+    steady_state_curated = steady_state,
+    sample_text_uninformative = str_detect(sample_text, "^sample\\s*\\d+$"),
+    steady_state_candidate = (
+      (has_wt_in_sample | (sample_text_uninformative & has_wt_in_experiment)) &
+        !has_mut_in_sample &
+        !has_treatment_in_sample &
+        !has_time_in_sample &
+        !has_diff_in_sample
+    ),
+    steady_reason = paste(
+      ifelse(has_wt_in_sample, "WT_sample", ifelse(has_wt_in_experiment, "WT_exp", "no_WT")),
+      ifelse(has_mut_in_sample, "mut_sample", "no_mut_sample"),
+      ifelse(has_treatment_in_sample, "treat_sample", "no_treat_sample"),
+      ifelse(has_time_in_sample, "time_sample", "no_time_sample"),
+      ifelse(has_diff_in_sample, "diff_sample", "no_diff_sample"),
+      sep = ";"
+    )
+  )
+
+readr::write_csv(meta_class, file.path(OUT_QC, "metadata_text_classification_full.csv"))
+
+steady_samples <- meta_class %>%
+  filter(
+    bw_exists,
+    steady_state_curated,
+    inferred_state %in% c("ESC", "EpiLC", "EpiSC")
+  ) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+readr::write_csv(steady_samples, file.path(OUT_QC, "steady_state_text_filtered_samples.csv"))
+readr::write_csv(steady_samples, file.path(OUT_QC, "steady_state_curated_filtered_samples.csv"))
+
+meta_class %>%
+  filter(bw_exists, inferred_state %in% c("ESC", "EpiLC", "EpiSC")) %>%
+  dplyr::count(steady_state_curated, inferred_state, sort = TRUE)
+```
+
+## 6. Load / Build Marker-Peak Matrix
+
+```{r load-matrix, message=FALSE, warning=FALSE}
+matrix_cache <- file.path(RESULTS_DIR, "qc", "matrix_and_metadata_refiltered_marker_peaks.rds")
+
+if (file.exists(matrix_cache)) {
+  cached <- readRDS(matrix_cache)
+  peak_matrix_raw <- sanitize_numeric_matrix(cached$peak_matrix_raw)
+  peak_matrix_norm <- sanitize_numeric_matrix(cached$peak_matrix_norm)
+  peak_annot <- cached$peak_annot
+  size_factor <- cached$size_factor
+
+  peak_matrix_norm[is.na(peak_matrix_norm)] <- 0
+  peak_matrix_norm[peak_matrix_norm < 0] <- 0
+} else {
+  stop("Cached matrix not found at: ", matrix_cache, "\nRun the exhaustive notebook first to build the matrix cache.")
+}
+
+peak_annot <- peak_annot %>%
+  mutate(
+    cluster = as.character(cluster),
+    primary_gene = ifelse(is.na(primary_gene) | primary_gene == "", parse_first_gene(closest_TSS), primary_gene)
+  )
+
+peak_regions_gr <- Signac::StringToGRanges(peak_annot$region, sep = c("-", "-"))
+peak_regions_gr$peak_id <- peak_annot$peak_id
+peak_regions_gr$cluster <- peak_annot$cluster
+
+steady_ids <- intersect(steady_samples$sample_id, rownames(peak_matrix_raw))
+steady_reference_meta <- steady_samples %>%
+  filter(sample_id %in% steady_ids) %>%
+  transmute(
+    sample_id,
+    state = inferred_state,
+    study_accession,
+    sample_title,
+    dataset_label = sample_id,
+    bw_path,
+    source_type = "steady_state"
+  )
+
+epiblast_refs <- tibble(
+  sample_id = names(epiblast_reference_files),
+  state = names(epiblast_reference_files),
+  study_accession = "Sendra_epiblast",
+  sample_title = c(
+    "Sendra epiblast cluster C2",
+    "Sendra epiblast cluster C3",
+    "Sendra epiblast cluster C4"
+  ),
+  dataset_label = sample_id,
+  bw_path = unname(epiblast_reference_files),
+  source_type = "epiblast_reference"
+) %>%
+  mutate(bw_exists = file.exists(bw_path)) %>%
+  filter(bw_exists)
+
+epiblast_raw_list <- purrr::map(epiblast_refs$bw_path, ~bw_mean_over_ranges_safe(.x, peak_regions_gr))
+if (any(!purrr::map_lgl(epiblast_raw_list, "ok"))) {
+  bad_refs <- epiblast_refs$sample_id[!purrr::map_lgl(epiblast_raw_list, "ok")]
+  stop("Failed to extract epiblast reference signal for: ", paste(bad_refs, collapse = ", "))
+}
+
+epiblast_raw <- do.call(rbind, purrr::map(epiblast_raw_list, "values"))
+rownames(epiblast_raw) <- epiblast_refs$sample_id
+colnames(epiblast_raw) <- peak_annot$peak_id
+
+steady_reference_raw <- rbind(
+  peak_matrix_raw[steady_ids, , drop = FALSE],
+  epiblast_raw[, colnames(peak_matrix_raw), drop = FALSE]
+)
+
+steady_reference_sf_info <- compute_size_factors(steady_reference_raw)
+steady_reference_size_factor <- steady_reference_sf_info$size_factor
+steady_reference_norm <- sweep(steady_reference_raw, 1, steady_reference_size_factor, FUN = "/")
+steady_reference_norm <- sanitize_numeric_matrix(steady_reference_norm)
+steady_reference_norm[is.na(steady_reference_norm)] <- 0
+steady_reference_norm[steady_reference_norm < 0] <- 0
+
+steady_reference_meta <- bind_rows(
+  steady_reference_meta,
+  epiblast_refs %>%
+    select(sample_id, state, study_accession, sample_title, dataset_label, bw_path, source_type)
+) %>%
+  mutate(
+    state = factor(state, levels = c("ESC", "EpiLC", "EpiSC", "Epiblast_C2", "Epiblast_C3", "Epiblast_C4")),
+    source_type = factor(source_type, levels = c("steady_state", "epiblast_reference"))
+  )
+
+readr::write_csv(
+  steady_reference_meta,
+  file.path(OUT_QC, "steady_state_plus_epiblast_samples.csv")
+)
+readr::write_csv(
+  tibble(
+    sample_id = names(steady_reference_size_factor),
+    size_factor = unname(steady_reference_size_factor),
+    source_type = steady_reference_meta$source_type[match(names(steady_reference_size_factor), steady_reference_meta$sample_id)]
+  ),
+  file.path(OUT_QC, "steady_state_plus_epiblast_size_factors.csv")
+)
+
+cat("Matrix rows (samples):", nrow(peak_matrix_norm), "\n")
+cat("Matrix cols (peaks):", ncol(peak_matrix_norm), "\n")
+cat("Peaks by cluster:\n")
+print(table(peak_annot$cluster))
+```
+
+## 7. WT Steady-State PCA (All / C2 / C3 / C4)
+
+```{r steady-pca, fig.width=10.2, fig.height=11.0}
+if (nrow(steady_reference_norm) < 8) {
+  stop("Too few steady-state/reference samples after curated filtering. Found: ", nrow(steady_reference_norm))
+}
+
+run_pca_subset <- function(mat, peak_ids, meta_df, title_prefix, file_prefix) {
+  peak_ids <- intersect(peak_ids, colnames(mat))
+  if (length(peak_ids) < 2) return(NULL)
+
+  m <- mat[, peak_ids, drop = FALSE]
+  m <- sanitize_numeric_matrix(m)
+  m[m < 0] <- 0
+
+  keep_cols <- matrixStats::colVars(m, na.rm = TRUE)
+  keep_cols <- is.finite(keep_cols) & keep_cols > 1e-10
+  m <- m[, keep_cols, drop = FALSE]
+
+  if (ncol(m) < 2 || nrow(m) < 3) return(NULL)
+
+  m_log <- log2(m + 1)
+  keep_log <- matrixStats::colVars(m_log, na.rm = TRUE)
+  keep_log <- is.finite(keep_log) & keep_log > 1e-8
+  m_log <- m_log[, keep_log, drop = FALSE]
+
+  if (ncol(m_log) < 2 || nrow(m_log) < 3) return(NULL)
+
+  pca <- prcomp(m_log, center = TRUE, scale. = FALSE)
+  if (ncol(pca$x) < 2) return(NULL)
+
+  var_exp <- (pca$sdev^2) / sum(pca$sdev^2)
+  df <- tibble(sample_id = rownames(m_log), PC1 = pca$x[, 1], PC2 = pca$x[, 2]) %>%
+    left_join(meta_df, by = "sample_id") %>%
+    mutate(state = factor(state, levels = c("ESC", "EpiLC", "EpiSC", "Epiblast_C2", "Epiblast_C3", "Epiblast_C4")))
+
+  readr::write_csv(df, file.path(OUT_PCA, paste0(file_prefix, "_coords.csv")))
+
+  p_state <- ggplot(df, aes(PC1, PC2, color = state, shape = source_type)) +
+    stat_ellipse(
+      data = df %>% filter(source_type == "steady_state"),
+      aes(group = state),
+      type = "t",
+      linewidth = 0.40,
+      alpha = 0.20,
+      show.legend = FALSE
+    ) +
+    geom_point(size = 2.2, alpha = 0.92) +
+    geom_text_repel(
+      data = df %>% filter(source_type == "epiblast_reference"),
+      aes(label = sample_id),
+      size = 2.8,
+      seed = 42,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = steady_plot_colors, drop = FALSE) +
+    scale_shape_manual(values = c("steady_state" = 16, "epiblast_reference" = 17), drop = FALSE) +
+    theme_pub() +
+    labs(
+      title = paste0(title_prefix, " (state + epiblast references)"),
+      x = paste0("PC1 (", sprintf("%.1f", 100 * var_exp[1]), "%)"),
+      y = paste0("PC2 (", sprintf("%.1f", 100 * var_exp[2]), "%)"),
+      shape = "Source"
+    )
+
+  study_levels <- unique(as.character(df$study_accession))
+  study_pal <- setNames(scales::hue_pal(l = 55, c = 100)(length(study_levels)), study_levels)
+  if ("Sendra_epiblast" %in% names(study_pal)) study_pal["Sendra_epiblast"] <- "#111111"
+
+  p_study <- ggplot(df, aes(PC1, PC2, color = study_accession, shape = source_type)) +
+    geom_point(size = 2.0, alpha = 0.92) +
+    geom_text_repel(
+      data = df %>% filter(source_type == "epiblast_reference"),
+      aes(label = sample_id),
+      size = 2.8,
+      seed = 42,
+      show.legend = FALSE
+    ) +
+    scale_color_manual(values = study_pal, drop = FALSE) +
+    scale_shape_manual(values = c("steady_state" = 16, "epiblast_reference" = 17), drop = FALSE) +
+    theme_pub() +
+    labs(
+      title = paste0(title_prefix, " (color: study accession)"),
+      x = paste0("PC1 (", sprintf("%.1f", 100 * var_exp[1]), "%)"),
+      y = paste0("PC2 (", sprintf("%.1f", 100 * var_exp[2]), "%)"),
+      shape = "Source"
+    )
+
+  combo <- p_state | p_study
+  ggsave(file.path(OUT_PCA, paste0(file_prefix, "_plots.png")), combo, width = 10, height = 3, dpi = 550)
+  ggsave(file.path(OUT_PCA, paste0(file_prefix, "_plots.svg")), combo, width = 10, height = 3)
+
+  combo
+}
+
+cluster_idx <- split(peak_annot$peak_id, peak_annot$cluster)
+
+p_all <- run_pca_subset(steady_reference_norm, peak_annot$peak_id, steady_reference_meta,
+                        "Steady-state WT PCA + epiblast references: all epiblast marker peaks", "steady_WT_PCA_all_markers")
+p_c2 <- run_pca_subset(steady_reference_norm, cluster_idx[["C2"]], steady_reference_meta,
+                       "Steady-state WT PCA + epiblast references: C2 marker peaks", "steady_WT_PCA_C2")
+p_c3 <- run_pca_subset(steady_reference_norm, cluster_idx[["C3"]], steady_reference_meta,
+                       "Steady-state WT PCA + epiblast references: C3 marker peaks", "steady_WT_PCA_C3")
+p_c4 <- run_pca_subset(steady_reference_norm, cluster_idx[["C4"]], steady_reference_meta,
+                       "Steady-state WT PCA + epiblast references: C4 marker peaks", "steady_WT_PCA_C4")
+
+p_list <- list(p_all, p_c2, p_c3, p_c4)
+p_list <- p_list[!vapply(p_list, is.null, logical(1))]
+
+wrap_plots(p_list, ncol = 1)
+```
+
+## 8. WT Steady-State Coverage Profiles Around Marker Peaks
+
+```{r steady-covprofiles, fig.width=8, fig.height=3, message=FALSE, warning=FALSE}
+steady_gr <- Signac::StringToGRanges(peak_annot$region, sep = c("-", "-"))
+steady_gr$cluster <- peak_annot$cluster
+feature_recentered <- make_profile_window(steady_gr, window_bp = profile_window_bp)
+feature_recentered$cluster <- peak_annot$cluster
+cluster_reference_state <- c("C2" = "Epiblast_C2", "C3" = "Epiblast_C3", "C4" = "Epiblast_C4")
+
+build_cluster_state_profile <- function(cluster_name) {
+  idx <- which(feature_recentered$cluster == cluster_name)
+  if (length(idx) == 0) return(list(profile = tibble(), sample = tibble()))
+
+  gr <- feature_recentered[idx]
+  keep_states <- c("ESC", "EpiLC", "EpiSC", cluster_reference_state[[cluster_name]])
+  st <- steady_reference_meta %>%
+    filter(sample_id %in% rownames(steady_reference_norm), as.character(state) %in% keep_states) %>%
+    filter(file.exists(bw_path))
+
+  if (nrow(st) < 3) return(list(profile = tibble(), sample = tibble()))
+
+  cvglists <- lapply(st$bw_path, function(p) {
+    rtracklayer::import(p, format = "BigWig", which = gr, as = "RleList")
+  })
+  names(cvglists) <- st$sample_id
+
+  sig <- ChIPpeakAnno::featureAlignedSignal(cvglists, gr, upstream = profile_window_bp, downstream = profile_window_bp)
+
+  # per-sample mean profile over all peaks in this cluster
+  sample_profiles <- purrr::imap_dfr(sig, function(mat, sid) {
+    sf <- steady_reference_size_factor[match(sid, names(steady_reference_size_factor))]
+    if (!is.finite(sf) || sf <= 0) sf <- 1
+    mat_norm <- mat / sf
+    tibble(
+      sample_id = sid,
+      position_bp = seq(-profile_window_bp, profile_window_bp, length.out = ncol(mat)),
+      mean_signal = colMeans(log2(mat_norm + 1), na.rm = TRUE)
+    )
+  }) %>%
+    left_join(st %>% select(sample_id, state, study_accession, dataset_label, source_type), by = "sample_id")
+
+  profile_state <- sample_profiles %>%
+    group_by(state, source_type, position_bp) %>%
+    summarise(
+      mean_signal = mean(mean_signal, na.rm = TRUE),
+      q25 = quantile(mean_signal, 0.25, na.rm = TRUE),
+      q75 = quantile(mean_signal, 0.75, na.rm = TRUE),
+      n_samples = dplyr::n_distinct(sample_id),
+      .groups = "drop"
+    ) %>%
+    mutate(cluster = cluster_name)
+
+  # Per-sample cluster-level summaries for statistics.
+  sample_level <- sample_profiles %>%
+    group_by(sample_id, state, study_accession, dataset_label, source_type) %>%
+    summarise(
+      cluster_mean_signal = mean(mean_signal, na.rm = TRUE),
+      center_mean_signal = mean(mean_signal[abs(position_bp) <= half_width_bp], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(cluster = cluster_name)
+
+  list(profile = profile_state, sample = sample_level)
+}
+
+cov_build <- lapply(c("C2", "C3", "C4"), build_cluster_state_profile)
+cov_steady <- bind_rows(lapply(cov_build, `[[`, "profile"))
+cov_steady_sample <- bind_rows(lapply(cov_build, `[[`, "sample"))
+
+readr::write_csv(cov_steady, file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4.csv"))
+readr::write_csv(cov_steady_sample, file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_sample_level.csv"))
+readr::write_csv(cov_steady_sample, file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_swarm_input.csv"))
+
+# Kruskal-Wallis across states for each cluster using per-sample summaries.
+cov_steady_stats_sample <- cov_steady_sample %>%
+  filter(source_type == "steady_state")
+
+kw_stats <- cov_steady_stats_sample %>%
+  group_by(cluster) %>%
+  group_modify(~{
+    d <- .x %>% filter(is.finite(cluster_mean_signal), !is.na(state))
+    if (nrow(d) < 3 || dplyr::n_distinct(d$state) < 2) {
+      return(tibble(kw_p = NA_real_, kw_stat = NA_real_, n = nrow(d)))
+    }
+    kt <- kruskal.test(cluster_mean_signal ~ state, data = d)
+    tibble(kw_p = as.numeric(kt$p.value), kw_stat = as.numeric(kt$statistic), n = nrow(d))
+  }) %>%
+  ungroup() %>%
+  mutate(kw_p_adj_bh = p.adjust(kw_p, method = "BH"))
+
+# Pairwise Wilcoxon and % differences of per-state means.
+state_means <- cov_steady_stats_sample %>%
+  group_by(cluster, state) %>%
+  summarise(mean_signal = mean(cluster_mean_signal, na.rm = TRUE), .groups = "drop")
+
+pairwise_stats <- cov_steady_stats_sample %>%
+  group_by(cluster) %>%
+  group_modify(~{
+    d <- .x %>% filter(is.finite(cluster_mean_signal), !is.na(state))
+    st <- sort(unique(as.character(d$state)))
+    if (length(st) < 2) return(tibble())
+    cmb <- combn(st, 2, simplify = FALSE)
+    bind_rows(lapply(cmb, function(cc) {
+      x <- d$cluster_mean_signal[d$state == cc[1]]
+      y <- d$cluster_mean_signal[d$state == cc[2]]
+      wt <- suppressWarnings(wilcox.test(x, y, exact = FALSE))
+      tibble(group1 = cc[1], group2 = cc[2], p = as.numeric(wt$p.value))
+    }))
+  }) %>%
+  ungroup() %>%
+  mutate(p_adj_bh = p.adjust(p, method = "BH")) %>%
+  left_join(state_means %>% dplyr::rename(group1 = state, mean1 = mean_signal), by = c("cluster", "group1")) %>%
+  left_join(state_means %>% dplyr::rename(group2 = state, mean2 = mean_signal), by = c("cluster", "group2")) %>%
+  mutate(
+    pct_diff_group1_vs_group2 = 100 * (mean1 - mean2) / pmax(abs(mean2), 1e-9),
+    higher_state = ifelse(mean1 >= mean2, group1, group2),
+    significant = p_adj_bh < fdr_cutoff
+  )
+
+readr::write_csv(kw_stats, file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_kw_stats.csv"))
+readr::write_csv(pairwise_stats, file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_pairwise_stats_pctdiff.csv"))
+
+y_lim_max <- max(cov_steady$q75, na.rm = TRUE) * 1.05
+y_lim_max <- ifelse(is.finite(y_lim_max) && y_lim_max > 0, y_lim_max, 1)
+
+kw_ann <- kw_stats %>%
+  mutate(
+    position_bp = -0.96 * profile_window_bp,
+    mean_signal = 0.97 * y_lim_max,
+    label = paste0("KW p(BH)=", formatC(kw_p_adj_bh, format = "e", digits = 2))
+  )
+
+p_cov <- ggplot(cov_steady, aes(position_bp, mean_signal, color = state, fill = state)) +
+  geom_ribbon(
+    data = cov_steady %>% filter(source_type == "steady_state"),
+    aes(ymin = q25, ymax = q75),
+    alpha = 0.12,
+    linewidth = 0,
+    show.legend = FALSE
+  ) +
+  geom_line(aes(linetype = source_type), linewidth = 0.90) +
+  geom_rect(
+    data = tibble(cluster = c("C2", "C3", "C4"), xmin = -half_width_bp, xmax = half_width_bp, ymin = -Inf, ymax = Inf),
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = "#F4D03F35",
+    color = NA
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.35, color = "grey30") +
+  geom_text(
+    data = kw_ann,
+    aes(x = position_bp, y = mean_signal, label = label),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = 0
+  ) +
+  facet_wrap(~cluster, scales = "fixed", ncol = 3) +
+  scale_color_manual(values = steady_plot_colors, drop = FALSE) +
+  scale_fill_manual(values = steady_plot_colors, drop = FALSE) +
+  scale_linetype_manual(values = c("steady_state" = "solid", "epiblast_reference" = "longdash"), drop = FALSE) +
+  coord_cartesian(ylim = c(0, y_lim_max)) +
+  theme_pub() +
+  labs(
+    title = "Steady-state WT coverage profiles around epiblast marker peaks",
+    subtitle = "Cluster-specific profiles (C2/C3/C4), ±2 kb around peak center | matching Sendra epiblast reference added per cluster | yellow band = peak window",
+    x = "Position from peak center (bp)",
+    y = "Mean log2(signal + 1)",
+    color = "State",
+    linetype = "Source"
+  )
+
+p_cov
+
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4.png"), p_cov, width = 9.8, height = 2.9, dpi = 550)
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4.svg"), p_cov, width = 9.8, height = 2.9)
+
+cov_steady_stem_only <- cov_steady %>%
+  filter(source_type == "steady_state")
+
+y_lim_max_stem <- max(cov_steady_stem_only$q75, na.rm = TRUE) * 1.05
+y_lim_max_stem <- ifelse(is.finite(y_lim_max_stem) && y_lim_max_stem > 0, y_lim_max_stem, 1)
+
+kw_ann_stem <- kw_stats %>%
+  mutate(
+    position_bp = -0.96 * profile_window_bp,
+    mean_signal = 0.97 * y_lim_max_stem,
+    label = paste0("KW p(BH)=", formatC(kw_p_adj_bh, format = "e", digits = 2))
+  )
+
+p_cov_stem_only <- ggplot(cov_steady_stem_only, aes(position_bp, mean_signal, color = state, fill = state)) +
+  geom_ribbon(aes(ymin = q25, ymax = q75), alpha = 0.12, linewidth = 0, show.legend = FALSE) +
+  geom_line(linewidth = 0.90) +
+  geom_rect(
+    data = tibble(cluster = c("C2", "C3", "C4"), xmin = -half_width_bp, xmax = half_width_bp, ymin = -Inf, ymax = Inf),
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = "#F4D03F35",
+    color = NA
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.35, color = "grey30") +
+  geom_text(
+    data = kw_ann_stem,
+    aes(x = position_bp, y = mean_signal, label = label),
+    inherit.aes = FALSE,
+    size = 2.5,
+    hjust = 0
+  ) +
+  facet_wrap(~cluster, scales = "fixed", ncol = 3) +
+  scale_color_manual(values = state_colors, drop = FALSE) +
+  scale_fill_manual(values = state_colors, drop = FALSE) +
+  coord_cartesian(ylim = c(0, y_lim_max_stem)) +
+  theme_pub() +
+  labs(
+    title = "Steady-state WT coverage profiles around epiblast marker peaks",
+    subtitle = "Stem-cell states only (ESC/EpiLC/EpiSC), ±2 kb around peak center | yellow band = peak window",
+    x = "Position from peak center (bp)",
+    y = "Mean log2(signal + 1)",
+    color = "State"
+  )
+
+p_cov_stem_only
+
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_stem_only.png"), p_cov_stem_only, width = 8, height = 3, dpi = 550)
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_stem_only.svg"), p_cov_stem_only, width = 8, height = 3)
+
+swarm_state_levels <- c("ESC", "EpiLC", "EpiSC", "Epiblast_ref")
+swarm_df <- cov_steady_sample %>%
+  mutate(
+    display_state = ifelse(grepl("^Epiblast_", as.character(state)), "Epiblast_ref", as.character(state)),
+    display_state = factor(display_state, levels = swarm_state_levels)
+  )
+
+study_levels <- unique(as.character(swarm_df$study_accession))
+study_pal <- setNames(scales::hue_pal(l = 55, c = 100)(length(study_levels)), study_levels)
+if ("Sendra_epiblast" %in% names(study_pal)) study_pal["Sendra_epiblast"] <- "#111111"
+
+p_cov_swarm <- ggplot(swarm_df, aes(display_state, center_mean_signal, color = study_accession, label = dataset_label)) +
+  ggbeeswarm::geom_quasirandom(width = 0.18, alpha = 0.92, size = 1.9) +
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.55,
+    fatten = 0,
+    linewidth = 0.32,
+    color = "black"
+  ) +
+  stat_summary(
+    fun.min = ~quantile(.x, 0.25, na.rm = TRUE),
+    fun.max = ~quantile(.x, 0.75, na.rm = TRUE),
+    geom = "errorbar",
+    width = 0.18,
+    linewidth = 0.28,
+    color = "grey30"
+  ) +
+  geom_text(
+    position = position_jitter(width = 0.10, height = 0),
+    size = 1.8,
+    alpha = 0.80,
+    check_overlap = TRUE,
+    show.legend = FALSE,
+  ) +
+  facet_wrap(~cluster, scales = "fixed", ncol = 3) +
+  scale_color_manual(values = study_pal, drop = FALSE) +
+  theme_pub() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "Steady-state marker-peak center signal by dataset and study accession",
+    subtitle = "Each point is one BigWig; colored by study accession; labels show dataset IDs; black line = mean, grey line = IQR",
+    x = NULL,
+    y = "Center-window mean log2(signal + 1)",
+    color = "Study accession"
+  )
+
+p_cov_swarm
+
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_swarm_by_study.png"), p_cov_swarm, width = 10, height = 10, dpi = 550)
+ggsave(file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_swarm_by_study.svg"), p_cov_swarm, width = 10, height = 10)
+
+kw_stats
+pairwise_stats
+```
+
+## 9. Study-Wise Design Inference from Titles
+
+```{r study-manifest-build, message=FALSE, warning=FALSE}
+study_meta <- meta_class %>%
+  filter(bw_exists, sample_id %in% rownames(peak_matrix_norm)) %>%
+  mutate(
+    is_wt = has_wt_keyword & !has_mut_keyword,
+    is_mut = has_mut_keyword,
+    cond_label = dplyr::case_when(
+      is_mut ~ ifelse(is.na(mutant_label), "mutant", mutant_label),
+      !is.na(treatment_label) ~ paste0("treat:", treatment_label),
+      is_wt ~ "WT",
+      TRUE ~ "other"
+    ),
+    study_context = str_trim(str_sub(experiment_title, 1, 140))
+  ) %>%
+  distinct(sample_id, .keep_all = TRUE)
+
+manifest_rows <- list()
+aid <- 1L
+
+for (study in sort(unique(study_meta$study_accession))) {
+  sm <- study_meta %>% filter(study_accession == study)
+  if (nrow(sm) < 4) next
+
+  # WT vs mutant
+  wt <- sm %>% filter(is_wt)
+  mut <- sm %>% filter(is_mut)
+  if (nrow(wt) >= min_group_n && nrow(mut) >= min_group_n) {
+    manifest_rows[[length(manifest_rows) + 1]] <- tibble(
+      analysis_id = sprintf("an%04d", aid),
+      study_accession = study,
+      analysis_type = "WT_vs_mutant",
+      analysis_title = paste0("WT vs mutant | ", dplyr::first(sm$study_context)),
+      group_a_label = "mutant",
+      group_b_label = "WT",
+      group_a_ids = paste(mut$sample_id, collapse = "|"),
+      group_b_ids = paste(wt$sample_id, collapse = "|"),
+      n_a = nrow(mut),
+      n_b = nrow(wt),
+      n_total = nrow(sm),
+      context = dplyr::first(sm$study_context)
+    )
+    aid <- aid + 1L
+  }
+
+  # treatment vs control
+  trt <- sm %>% filter(!is.na(treatment_label))
+  ctrl <- sm %>% filter(is_wt & is.na(treatment_label))
+  if (nrow(trt) >= min_group_n && nrow(ctrl) >= min_group_n) {
+    manifest_rows[[length(manifest_rows) + 1]] <- tibble(
+      analysis_id = sprintf("an%04d", aid),
+      study_accession = study,
+      analysis_type = "treatment_vs_control",
+      analysis_title = paste0("Treatment vs control | ", dplyr::first(sm$study_context)),
+      group_a_label = "treated",
+      group_b_label = "control",
+      group_a_ids = paste(trt$sample_id, collapse = "|"),
+      group_b_ids = paste(ctrl$sample_id, collapse = "|"),
+      n_a = nrow(trt),
+      n_b = nrow(ctrl),
+      n_total = nrow(sm),
+      context = dplyr::first(sm$study_context)
+    )
+    aid <- aid + 1L
+  }
+
+  # time course
+  sm_time <- sm %>% filter(!is.na(time_hours))
+  if (nrow(sm_time) >= 6 && dplyr::n_distinct(sm_time$time_hours) >= min_timepoints) {
+    manifest_rows[[length(manifest_rows) + 1]] <- tibble(
+      analysis_id = sprintf("an%04d", aid),
+      study_accession = study,
+      analysis_type = "time_course",
+      analysis_title = paste0("Time-course trend | ", dplyr::first(sm$study_context)),
+      group_a_label = "later_time",
+      group_b_label = "earlier_time",
+      group_a_ids = paste(sm_time$sample_id, collapse = "|"),
+      group_b_ids = NA_character_,
+      n_a = nrow(sm_time),
+      n_b = NA_integer_,
+      n_total = nrow(sm),
+      context = dplyr::first(sm$study_context)
+    )
+    aid <- aid + 1L
+  }
+}
+
+manifest <- bind_rows(manifest_rows) %>% distinct(analysis_id, .keep_all = TRUE)
+readr::write_csv(manifest, file.path(OUT_STUDY_TABLES, "study_analysis_manifest.csv"))
+
+manifest %>% dplyr::count(analysis_type, sort = TRUE)
+```
+
+## 10. Study-Wise Peak-Level Statistics (Directional)
+
+```{r studywise-stats, message=FALSE, warning=FALSE}
+run_pairwise_analysis <- function(row, mat, annot, study_meta_df) {
+  gA <- unlist(strsplit(row$group_a_ids, "\\|"))
+  gB <- unlist(strsplit(row$group_b_ids, "\\|"))
+  gA <- intersect(gA, rownames(mat))
+  gB <- intersect(gB, rownames(mat))
+  if (length(gA) < min_group_n || length(gB) < min_group_n) return(NULL)
+
+  res <- vector("list", ncol(mat))
+  for (j in seq_len(ncol(mat))) {
+    x <- mat[gA, j]
+    y <- mat[gB, j]
+    wt <- suppressWarnings(wilcox.test(x, y, exact = FALSE))
+    l2fc <- log2((mean(x, na.rm = TRUE) + 1e-6) / (mean(y, na.rm = TRUE) + 1e-6))
+    rb <- rank_biserial(x, y)
+    higher <- ifelse(abs(l2fc) < 1e-9, "neither", ifelse(l2fc > 0, row$group_a_label, row$group_b_label))
+    res[[j]] <- tibble(
+      peak_id = colnames(mat)[j],
+      mean_group_a = mean(x, na.rm = TRUE),
+      mean_group_b = mean(y, na.rm = TRUE),
+      log2FC_groupA_vs_groupB = l2fc,
+      effect_rank_biserial = rb,
+      p_value = wt$p.value,
+      higher_accessibility_condition = higher
+    )
+  }
+
+  bind_rows(res) %>%
+    mutate(
+      p_adj_bh = p.adjust(p_value, method = "BH"),
+      significant = p_adj_bh < fdr_cutoff,
+      significant_directional = significant & abs(log2FC_groupA_vs_groupB) >= min_abs_log2fc,
+      analysis_id = row$analysis_id,
+      study_accession = row$study_accession,
+      analysis_type = row$analysis_type,
+      analysis_title = row$analysis_title,
+      group_a_label = row$group_a_label,
+      group_b_label = row$group_b_label
+    ) %>%
+    left_join(annot %>% select(peak_id, cluster, region, closest_TSS, primary_gene, type), by = "peak_id") %>%
+    mutate(annotation_category = type) %>%
+    arrange(p_adj_bh, desc(abs(log2FC_groupA_vs_groupB)))
+}
+
+run_timecourse_analysis <- function(row, mat, annot, study_meta_df) {
+  sid <- unlist(strsplit(row$group_a_ids, "\\|"))
+  sid <- intersect(sid, rownames(mat))
+  d <- study_meta_df %>%
+    filter(sample_id %in% sid) %>%
+    select(sample_id, time_hours) %>%
+    distinct() %>%
+    filter(!is.na(time_hours))
+
+  sid <- intersect(sid, d$sample_id)
+  if (length(sid) < 6 || dplyr::n_distinct(d$time_hours) < min_timepoints) return(NULL)
+
+  res <- vector("list", ncol(mat))
+  for (j in seq_len(ncol(mat))) {
+    sig <- mat[sid, j]
+    dd <- tibble(sample_id = sid, signal = sig) %>% left_join(d, by = "sample_id")
+    if (all(is.na(dd$signal)) || dplyr::n_distinct(dd$time_hours) < min_timepoints) {
+      res[[j]] <- tibble(peak_id = colnames(mat)[j], rho = NA_real_, slope = NA_real_, p_value = NA_real_)
+      next
+    }
+    cor_test <- suppressWarnings(cor.test(dd$time_hours, dd$signal, method = "spearman"))
+    lm_fit <- suppressWarnings(lm(signal ~ time_hours, data = dd))
+    slope <- coef(lm_fit)["time_hours"]
+    res[[j]] <- tibble(
+      peak_id = colnames(mat)[j],
+      rho = as.numeric(cor_test$estimate),
+      slope = as.numeric(slope),
+      p_value = as.numeric(cor_test$p.value)
+    )
+  }
+
+  bind_rows(res) %>%
+    mutate(
+      p_adj_bh = p.adjust(p_value, method = "BH"),
+      significant = p_adj_bh < fdr_cutoff,
+      significant_directional = significant & abs(rho) >= 0.30,
+      higher_accessibility_condition = case_when(
+        is.na(rho) ~ "undetermined",
+        rho > 0 ~ "later_time_higher",
+        rho < 0 ~ "earlier_time_higher",
+        TRUE ~ "flat"
+      ),
+      analysis_id = row$analysis_id,
+      study_accession = row$study_accession,
+      analysis_type = row$analysis_type,
+      analysis_title = row$analysis_title,
+      group_a_label = "later_time",
+      group_b_label = "earlier_time",
+      log2FC_groupA_vs_groupB = slope,
+      effect_rank_biserial = rho
+    ) %>%
+    left_join(annot %>% select(peak_id, cluster, region, closest_TSS, primary_gene, type), by = "peak_id") %>%
+    mutate(annotation_category = type) %>%
+    arrange(p_adj_bh, desc(abs(rho)))
+}
+
+analysis_summ <- list()
+for (i in seq_len(nrow(manifest))) {
+  row <- manifest[i, ]
+
+  dt <- if (row$analysis_type == "time_course") {
+    run_timecourse_analysis(row, peak_matrix_norm, peak_annot, study_meta)
+  } else {
+    run_pairwise_analysis(row, peak_matrix_norm, peak_annot, study_meta)
+  }
+
+  if (is.null(dt)) next
+
+  out_file <- file.path(OUT_STUDY_TABLES, paste0(row$analysis_id, "_", row$analysis_type, "_peak_stats.csv"))
+  readr::write_csv(dt, out_file)
+
+  top_file <- file.path(OUT_STUDY_TABLES, paste0(row$analysis_id, "_top_peaks.csv"))
+  readr::write_csv(
+    dt %>%
+      slice_head(n = 20) %>%
+      transmute(
+        analysis_id,
+        study_accession,
+        analysis_type,
+        peak_coordinates = region,
+        cluster,
+        gene = primary_gene,
+        higher_accessibility_condition,
+        log2_fold_change_or_slope = log2FC_groupA_vs_groupB,
+        adjusted_p_value = p_adj_bh,
+        effect = effect_rank_biserial,
+        significant_directional
+      ),
+    top_file
+  )
+
+  analysis_summ[[length(analysis_summ) + 1]] <- tibble(
+    analysis_id = row$analysis_id,
+    study_accession = row$study_accession,
+    analysis_type = row$analysis_type,
+    analysis_title = row$analysis_title,
+    n_sig = sum(dt$significant, na.rm = TRUE),
+    n_sig_directional = sum(dt$significant_directional, na.rm = TRUE),
+    table_file = out_file,
+    top_file = top_file
+  )
+}
+
+analysis_summary <- bind_rows(analysis_summ) %>% arrange(desc(n_sig_directional), desc(n_sig))
+readr::write_csv(analysis_summary, file.path(OUT_STUDY_TABLES, "study_analysis_summary.csv"))
+analysis_summary
+```
+
+## 11. Study-Wise Summary Plots
+
+```{r studywise-plots, fig.width=10.2, fig.height=4.6}
+if (nrow(analysis_summary) > 0) {
+  p1 <- ggplot(analysis_summary, aes(x = reorder(analysis_id, n_sig_directional), y = n_sig_directional, fill = analysis_type)) +
+    geom_col(width = 0.75) +
+    coord_flip() +
+    theme_pub() +
+    labs(
+      title = "Directional significant peaks per inferred study-analysis",
+      x = "Analysis ID",
+      y = "# significant directional peaks"
+    )
+
+  p2 <- ggplot(analysis_summary, aes(x = reorder(analysis_id, n_sig), y = n_sig, fill = analysis_type)) +
+    geom_col(width = 0.75) +
+    coord_flip() +
+    theme_pub() +
+    labs(
+      title = "BH-significant peaks per inferred study-analysis",
+      x = "Analysis ID",
+      y = "# significant peaks"
+    )
+
+  p1 | p2
+
+  ggsave(file.path(OUT_STUDY_PLOTS, "studywise_significant_peak_counts.png"), p1 | p2, width = 10.2, height = 4.6, dpi = 550)
+  ggsave(file.path(OUT_STUDY_PLOTS, "studywise_significant_peak_counts.svg"), p1 | p2, width = 10.2, height = 4.6)
+}
+```
+
+## 12. Browser-Like Stacked Coverage Plots with Gene/Exon Annotation
+
+```{r browser-plots, message=FALSE, warning=FALSE}
+txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+
+plot_browser_for_peak <- function(analysis_row, peak_row, sample_tbl, out_png, out_pdf) {
+  gr <- Signac::StringToGRanges(peak_row$region, sep = c("-", "-"))
+  chr <- as.character(seqnames(gr))[1]
+  pk_start <- start(gr)[1]
+  pk_end <- end(gr)[1]
+  pk_width <- as.numeric(pk_end - pk_start + 1)
+  flank <- max(10 * pk_width, browser_window_bp)
+  from <- max(1, pk_start - flank)
+  to <- pk_end + flank
+
+  # gene track
+  gene_track <- GeneRegionTrack(
+    txdb,
+    chromosome = chr,
+    start = from,
+    end = to,
+    transcriptAnnotation = "symbol",
+    background.title = "white",
+    name = "Genes"
+  )
+
+  # peak highlight track
+  peak_track <- AnnotationTrack(
+    start = pk_start,
+    end = pk_end,
+    chromosome = chr,
+    genome = "mm10",
+    name = "Peak",
+    fill = "#D95F02",
+    col = "#D95F02"
+  )
+
+  displayPars(gene_track) <- list(background.title = "white", background.panel = "white", col.axis = "black", col.title = "black")
+  displayPars(peak_track) <- list(background.title = "white", background.panel = "white", col.axis = "black", col.title = "black")
+
+  # sample tracks
+  sample_tracks <- list()
+  for (i in seq_len(nrow(sample_tbl))) {
+    sid <- sample_tbl$sample_id[i]
+    bw <- sample_tbl$bw_path[i]
+    grp <- sample_tbl$plot_group[i]
+    col <- sample_tbl$plot_color[i]
+    sf <- sample_tbl$size_factor[i]
+    if (!is.finite(sf) || sf <= 0) sf <- 1
+
+    tr <- DataTrack(
+      range = bw,
+      chromosome = chr,
+      genome = "mm10",
+      type = "l",
+      name = paste0(sid, " [", grp, "]"),
+      col = col,
+      lwd = 1.1,
+      transformation = function(x) x / sf
+    )
+    displayPars(tr) <- list(background.title = "white", background.panel = "white", col.axis = "black", col.title = "black", fontsize = 9)
+    sample_tracks[[length(sample_tracks) + 1]] <- tr
+  }
+
+  tr_list <- c(list(gene_track, peak_track), sample_tracks)
+  hl <- HighlightTrack(
+    trackList = tr_list,
+    start = pk_start,
+    end = pk_end,
+    chromosome = chr,
+    col = "#F4D03F50",
+    fill = "#F4D03F35",
+    inBackground = TRUE
+  )
+
+  png(out_png, width = 1800, height = max(1200, 160 + 140 * length(tr_list)), res = 180)
+  plotTracks(
+    hl,
+    from = from,
+    to = to,
+    transcriptAnnotation = "symbol",
+    background.panel = "white",
+    col.axis = "black",
+    main = paste0(analysis_row$analysis_id, " | ", peak_row$primary_gene, " | ", peak_row$region)
+  )
+  dev.off()
+
+  pdf(out_pdf, width = 12, height = max(6, 0.6 + 0.35 * length(tr_list)))
+  plotTracks(
+    hl,
+    from = from,
+    to = to,
+    transcriptAnnotation = "symbol",
+    background.panel = "white",
+    col.axis = "black",
+    main = paste0(analysis_row$analysis_id, " | ", peak_row$primary_gene, " | ", peak_row$region)
+  )
+  dev.off()
+}
+
+if (nrow(analysis_summary) > 0) {
+  pick_analyses <- analysis_summary %>% slice_head(n = max_browser_analyses)
+  browser_manifest_rows <- list()
+
+  for (i in seq_len(nrow(pick_analyses))) {
+    ar <- pick_analyses[i, ]
+    dt <- readr::read_csv(ar$table_file, show_col_types = FALSE)
+
+    top_dt <- dt %>%
+      filter(cluster %in% c("C2", "C3", "C4")) %>%
+      arrange(p_adj_bh, desc(abs(log2FC_groupA_vs_groupB)))
+
+    if (nrow(top_dt) == 0) {
+      top_dt <- dt %>% arrange(p_adj_bh, desc(abs(log2FC_groupA_vs_groupB)))
+    }
+
+    top_dt <- top_dt %>% slice_head(n = browser_peaks_per_analysis)
+    if (nrow(top_dt) == 0) next
+
+    this_manifest <- manifest %>% filter(analysis_id == ar$analysis_id)
+    if (nrow(this_manifest) == 0) next
+
+    if (this_manifest$analysis_type == "time_course") {
+      sid <- unlist(strsplit(this_manifest$group_a_ids, "\\|"))
+      smp <- study_meta %>%
+        filter(sample_id %in% sid) %>%
+        mutate(plot_group = paste0("t=", round(time_hours, 1), "h"),
+               plot_color = "#4C78A8") %>%
+        arrange(time_hours, sample_id)
+    } else {
+      sidA <- unlist(strsplit(this_manifest$group_a_ids, "\\|"))
+      sidB <- unlist(strsplit(this_manifest$group_b_ids, "\\|"))
+      smpA <- study_meta %>% filter(sample_id %in% sidA) %>% mutate(plot_group = this_manifest$group_a_label, plot_color = "#D95F02")
+      smpB <- study_meta %>% filter(sample_id %in% sidB) %>% mutate(plot_group = this_manifest$group_b_label, plot_color = "#1B9E77")
+      smp <- bind_rows(smpA, smpB)
+    }
+
+    smp <- smp %>% filter(file.exists(bw_path)) %>% distinct(sample_id, .keep_all = TRUE)
+    smp <- smp %>% mutate(size_factor = size_factor[match(sample_id, names(size_factor))])
+    if (nrow(smp) < 2) next
+
+    out_dir <- file.path(OUT_BROWSER, ar$analysis_id)
+    if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+    for (j in seq_len(nrow(top_dt))) {
+      pk <- top_dt[j, ]
+      gene_tag <- ifelse(is.na(pk$primary_gene) | pk$primary_gene == "", "noGene", pk$primary_gene)
+      tag <- paste0("peak", sprintf("%02d", j), "_", gsub("[^A-Za-z0-9_]+", "_", gene_tag))
+      out_png <- file.path(out_dir, paste0(tag, "_browser.png"))
+      out_pdf <- file.path(out_dir, paste0(tag, "_browser.pdf"))
+
+      try(plot_browser_for_peak(ar, pk, smp, out_png, out_pdf), silent = TRUE)
+
+      browser_manifest_rows[[length(browser_manifest_rows) + 1]] <- tibble(
+        analysis_id = ar$analysis_id,
+        study_accession = ar$study_accession,
+        analysis_type = ar$analysis_type,
+        peak_coordinates = pk$region,
+        gene = pk$primary_gene,
+        cluster = pk$cluster,
+        adjusted_p_value = pk$p_adj_bh,
+        higher_accessibility_condition = pk$higher_accessibility_condition,
+        browser_png = out_png,
+        browser_pdf = out_pdf
+      )
+    }
+  }
+
+  browser_manifest <- bind_rows(browser_manifest_rows)
+  readr::write_csv(browser_manifest, file.path(OUT_BROWSER, "browser_track_manifest.csv"))
+  browser_manifest
+}
+```
+
+## 13. Literature Context Table (for Biological Interpretation)
+
+```{r literature-context}
+literature_context <- tibble(
+  topic = c(
+    "MESP1 and cardiovascular progenitor commitment",
+    "NFATC1 and heart valve/endocardial lineage development",
+    "NOTCH signaling in cardiac development",
+    "PBX1/PBX2 in mesodermal developmental programs",
+    "NOTCH pathway crosstalk in heart development"
+  ),
+  why_relevant_here = c(
+    "Mesp1-linked marker peaks changing in time-course analyses are biologically coherent with cardiovascular lineage progression.",
+    "Nfatc1-linked peak shifts can indicate changes in endocardial/valvulogenic regulatory programs.",
+    "Notch1-linked accessibility differences are consistent with known cardiac developmental signaling effects.",
+    "Pbx1/2 perturbation studies in your metadata are expected to impact mesoderm-associated chromatin programs.",
+    "Study-level treatment or perturbation effects can involve Notch pathway interactions with WNT/BMP during differentiation."
+  ),
+  key_reference = c(
+    "Mesp1 patterns mesoderm into cardiac/hematopoietic/skeletal myogenic progenitors (PMID: 23642367).",
+    "Nfatc1 coordinates valve endocardial cell lineage for heart valve formation (PMID: 21597012).",
+    "Notch signaling in cardiac development and disease (PMID: 20816401).",
+    "Pbx1/Pbx2 govern mesodermal developmental programs (PMID: 18691704).",
+    "Notch and interacting pathways in cardiac development (PMID: 30287945)."
+  ),
+  source_url = c(
+    "https://pubmed.ncbi.nlm.nih.gov/23642367/",
+    "https://pubmed.ncbi.nlm.nih.gov/21597012/",
+    "https://pubmed.ncbi.nlm.nih.gov/20816401/",
+    "https://pubmed.ncbi.nlm.nih.gov/18691704/",
+    "https://pubmed.ncbi.nlm.nih.gov/30287945/"
+  )
+)
+
+readr::write_csv(literature_context, file.path(OUT_LIT, "literature_context_interpretation_table.csv"))
+literature_context
+```
+
+## 14. Outputs Index
+
+```{r outputs}
+cat("Outputs root:\n", OUT_ROOT, "\n\n")
+cat("QC:\n")
+cat("-", file.path(OUT_QC, "metadata_text_classification_full.csv"), "\n")
+cat("-", file.path(OUT_QC, "steady_state_text_filtered_samples.csv"), "\n\n")
+cat("-", file.path(OUT_QC, "steady_state_curated_filtered_samples.csv"), "\n")
+cat("-", file.path(OUT_QC, "steady_state_plus_epiblast_samples.csv"), "\n")
+cat("-", file.path(OUT_QC, "steady_state_plus_epiblast_size_factors.csv"), "\n\n")
+
+cat("Steady-state PCA:\n")
+cat("-", OUT_PCA, "\n\n")
+
+cat("Steady-state coverage:\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4.csv"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_sample_level.csv"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_swarm_input.csv"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_kw_stats.csv"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_pairwise_stats_pctdiff.csv"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4.png"), "\n\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_stem_only.png"), "\n")
+cat("-", file.path(OUT_STEADY_COV, "steady_state_covprofiles_C2C3C4_swarm_by_study.png"), "\n\n")
+
+cat("Study-wise analyses:\n")
+cat("-", file.path(OUT_STUDY_TABLES, "study_analysis_manifest.csv"), "\n")
+cat("-", file.path(OUT_STUDY_TABLES, "study_analysis_summary.csv"), "\n")
+cat("-", OUT_STUDY_TABLES, "\n")
+cat("-", OUT_STUDY_PLOTS, "\n")
+cat("-", file.path(OUT_BROWSER, "browser_track_manifest.csv"), "\n\n")
+
+cat("Literature context:\n")
+cat("-", file.path(OUT_LIT, "literature_context_interpretation_table.csv"), "\n")
+```
+
+## 15. Session Info
+
+```{r session-info}
+sessionInfo()
+```
