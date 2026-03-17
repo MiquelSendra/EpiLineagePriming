@@ -1,0 +1,101 @@
+# -----------------------------
+# OS / editor junk
+# -----------------------------
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# -----------------------------
+# R session / project junk
+# -----------------------------
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# -----------------------------
+# Python / Jupyter junk
+# -----------------------------
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# -----------------------------
+# Logs / temp
+# -----------------------------
+*.log
+*.tmp
+*.temp
+
+# -----------------------------
+# Rendered documents and reports
+# Keep source .Rmd and .ipynb, ignore rendered outputs
+# -----------------------------
+*.html
+*.nb.html
+*_files/
+
+# -----------------------------
+# Knitr / rmarkdown caches and figure folders
+# -----------------------------
+cache/
+cached/
+*_cache/
+
+
+# -----------------------------
+# Project-specific generated outputs
+# -----------------------------
+figures_scripts/output/
+
+# -----------------------------
+# Binary / serialized intermediate analysis objects
+# -----------------------------
+*.rds
+*.Rds
+*.rda
+*.RData
+*.qs
+*.feather
+*.parquet
+*.h5
+*.h5ad
+
+# -----------------------------
+# Image outputs commonly generated during analysis
+# Keep if you explicitly want final figures tracked
+# -----------------------------
+*.png
+*.pdf
+*.svg
+*.jpeg
+*.jpg
+*.tiff
+*.bmp
+
+# -----------------------------
+# renv: keep lockfile and bootstrap, ignore local library/cache
+# -----------------------------
+renv/library/
+renv/staging/
+renv/python/
+renv/local/
+
+# Keep these tracked
+!renv/activate.R
+!renv/settings.json
+!renv.lock
+
+# -----------------------------
+# Optional: ignore compressed archives
+# -----------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz

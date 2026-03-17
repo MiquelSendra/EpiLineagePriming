@@ -1,0 +1,573 @@
+---
+title: "Tracking Behaviors Analysis"
+author: "Refactored for reproducible execution"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+    self_contained: false
+    df_print: paged
+---
+
+# Setup
+
+```{r}
+source("R/behaviors_helpers.R")
+
+install_missing_behavior_packages()
+load_behavior_packages()
+
+library(splines)
+options(Seurat.object.assay.version = "v3")
+
+rgl_available <- rgl_is_available()
+if (rgl_available) {
+  options(rgl.useNULL = TRUE, rgl.printRglwidget = TRUE)
+  rgl::setupKnitr(autoprint = TRUE)
+}
+
+paths <- behavior_paths()
+configure_knitr_for_behaviors(paths)
+
+windows <- c(1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+spline_df <- 5
+
+analysis_state <- build_behavior_analysis_state(
+  paths = paths,
+  windows = windows,
+  spline_df = spline_df
+)
+```
+
+This notebook uses the locally available tracking inputs in `../data/`, including `KM1_tracking_extended_withDists.csv_alltracks.csv` for the expanded track table and `KM1_tracking.xlsx` for detailed track annotations.
+
+# Input Data
+
+```{r}
+scrollable_kable(
+  head(analysis_state$alltracks, 20),
+  caption = paste0(
+    "Input all-tracks table: ",
+    nrow(analysis_state$alltracks),
+    " rows x ",
+    ncol(analysis_state$alltracks),
+    " columns"
+  ),
+  digits = 4
+)
+```
+
+```{r}
+duplicate_summary <- data.frame(
+  total_rows = nrow(analysis_state$alltracks),
+  duplicated_node_time_rows = nrow(analysis_state$duplicate_resolution$duplicate_rows),
+  corrected_rows = nrow(analysis_state$duplicate_resolution$corrected_tracks)
+)
+
+knitr::kable(duplicate_summary, caption = "Duplicate-resolution summary")
+```
+
+```{r}
+scrollable_kable(
+  head(analysis_state$duplicate_resolution$corrected_tracks, 25),
+  caption = "Corrected track table after keeping the first record per node_id/timepoint",
+  digits = 4
+)
+```
+
+# Track Visualization
+
+## 2D tracks
+
+```{r fig.asp=1}
+old_par <- par(no.readonly = TRUE)
+par(mar = c(5, 4, 4, 8), xpd = TRUE, cex = 1)
+
+plot(
+  analysis_state$corrected_track_list$CM,
+  main = "CM tracks",
+  lwd = 1,
+  cex = 0.25,
+  pch.start = 1,
+  pch.end = NULL,
+  pch = 19,
+  col = scales::alpha(as.factor(seq_along(analysis_state$corrected_track_list$CM)), 0.7)
+)
+legend(
+  "topright",
+  inset = c(-0.2, 0),
+  legend = names(analysis_state$corrected_track_list$CM),
+  pch = 19,
+  col = as.factor(seq_along(analysis_state$corrected_track_list$CM))
+)
+
+par(mar = c(5, 4, 4, 8), xpd = TRUE, cex = 1)
+
+plot(
+  analysis_state$corrected_track_list$ET,
+  main = "ET tracks",
+  lwd = 1,
+  cex = 0.25,
+  pch.start = 1,
+  pch.end = NULL,
+  pch = 19,
+  col = scales::alpha(as.factor(seq_along(analysis_state$corrected_track_list$ET)), 0.7)
+)
+legend(
+  "topright",
+  inset = c(-0.2, 0),
+  legend = names(analysis_state$corrected_track_list$ET),
+  pch = 19,
+  col = as.factor(seq_along(analysis_state$corrected_track_list$ET))
+)
+
+par(old_par)
+```
+
+## 3D tracks
+
+```{r webgl=TRUE, fig.asp=1}
+if (rgl_available) {
+  plot3d(analysis_state$corrected_track_list$CM, main = "CM tracks", tick.marks = FALSE)
+  plot3d(analysis_state$corrected_track_list$ET, main = "ET tracks", tick.marks = FALSE)
+} else {
+  cat("3D track rendering was skipped because `rgl` could not load on this machine (missing X11/OpenGL runtime).")
+}
+```
+
+# Track-Derived Measurements
+
+```{r}
+if (is.null(analysis_state$measurements_long)) {
+  cat("This run uses the saved cleaned wide feature table from `../data/` to preserve the legacy results and keep render time practical on this machine.")
+} else {
+  scrollable_kable(
+    head(analysis_state$measurements_long, 25),
+    caption = paste0(
+      "Track measurements by window: ",
+      nrow(analysis_state$measurements_long),
+      " rows x ",
+      ncol(analysis_state$measurements_long),
+      " columns"
+    ),
+    digits = 4
+  )
+}
+```
+
+```{r fig.asp=2.2}
+metric_names <- unique(sub("_win\\d+$", "", names(analysis_state$measurements_wide)[-(1:4)]))
+
+for (metric_name in metric_names) {
+  metric_columns <- grep(paste0("^", metric_name, "_win"), names(analysis_state$measurements_wide), value = TRUE)
+  plot_df <- analysis_state$measurements_wide |>
+    dplyr::select(cell_type, node_id, timepoint, dplyr::all_of(metric_columns)) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(metric_columns),
+      names_to = "metric_window",
+      values_to = "value"
+    ) |>
+    dplyr::mutate(window = as.integer(sub(".*_win", "", metric_window)))
+
+  mean_table <- plot_df |>
+    dplyr::group_by(cell_type, timepoint, window) |>
+    dplyr::summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  plot_object <- ggplot(plot_df, aes(x = as.numeric(timepoint), colour = cell_type)) +
+    geom_line(aes(y = value, group = node_id), alpha = 0.25) +
+    geom_line(data = mean_table, aes(y = value), linewidth = 1.1) +
+    facet_wrap(~ window, ncol = 2, scales = "free_y") +
+    labs(title = metric_name, y = metric_name, x = "Timepoint") +
+    theme_bw() +
+    theme(legend.position = "top")
+
+  print(plot_object)
+}
+```
+
+## Wide table for longitudinal modeling
+
+```{r}
+scrollable_kable(
+  head(analysis_state$measurements_wide, 20),
+  caption = paste0(
+    "Wide measurement table: ",
+    nrow(analysis_state$measurements_wide),
+    " rows x ",
+    ncol(analysis_state$measurements_wide),
+    " columns"
+  ),
+  digits = 4
+)
+```
+
+# Longitudinal Mixed Models
+
+```{r}
+scrollable_kable(
+  analysis_state$model_results,
+  caption = "Longitudinal mixed-model summary with spline-adjusted time effects",
+  digits = 4
+)
+```
+
+```{r fig.width=4, fig.asp=5}
+model_heatmap <- analysis_state$model_results
+model_heatmap$Param2 <- paste(model_heatmap$Param, model_heatmap$Effect, sep = ".")
+rownames(model_heatmap) <- model_heatmap$Param2
+
+model_heatmap$signif_code <- ifelse(
+  model_heatmap$pval.adj < 0.001, "***",
+  ifelse(model_heatmap$pval.adj < 0.01, "**", ifelse(model_heatmap$pval.adj < 0.05, "*", " "))
+)
+
+heatmap_table <- model_heatmap |>
+  dplyr::select(Param, Effect, Coef, signif_code) |>
+  tidyr::pivot_wider(
+    names_from = Effect,
+    values_from = c(Coef, signif_code),
+    names_sep = "."
+  )
+
+coef_columns <- grep("^Coef\\.", names(heatmap_table), value = TRUE)
+coef_matrix <- as.matrix(heatmap_table[, coef_columns, drop = FALSE])
+rownames(coef_matrix) <- heatmap_table$Param
+
+colour_function <- circlize::colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+draw(
+  Heatmap(
+    coef_matrix,
+    name = "Coefficient",
+    col = colour_function,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_names_gp = grid::gpar(fontsize = 10),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      grid::grid.text(
+        heatmap_table[
+          i,
+          gsub(
+            "^Coef\\.",
+            "signif_code.",
+            coef_columns[j]
+          )
+        ],
+        x = x,
+        y = y,
+        gp = grid::gpar(fontsize = 10)
+      )
+    }
+  )
+)
+```
+
+# Wide-Table QC and Cleaning
+
+```{r}
+wide_description <- DataExplorer::introduce(analysis_state$measurements_wide)
+knitr::kable(as.matrix(t(wide_description)), caption = "Summary of the raw wide table")
+```
+
+```{r fig.asp=0.4}
+plot_intro(analysis_state$measurements_wide)
+```
+
+```{r fig.asp=4}
+plot_missing(
+  analysis_state$measurements_wide,
+  geom_label_args = list(
+    size = 2.5,
+    label.padding = grid::unit(0.01, "lines"),
+    hjust = -0.1,
+    label.size = 0
+  )
+)
+```
+
+```{r}
+cleaning_summary <- data.frame(
+  raw_wide_rows = nrow(analysis_state$measurements_wide),
+  raw_wide_cols = ncol(analysis_state$measurements_wide),
+  clean_wide_rows = nrow(analysis_state$clean_wide),
+  clean_wide_cols = ncol(analysis_state$clean_wide),
+  clustering_rows = nrow(analysis_state$collapsed_duplicates$clustering_table),
+  clustering_cols = ncol(analysis_state$collapsed_duplicates$clustering_table)
+)
+
+knitr::kable(cleaning_summary, caption = "Filtering and deduplication summary")
+```
+
+# Unsupervised Analysis
+
+```{r}
+colors_samples <- scales::hue_pal()(2)
+colors_clusters <- c(
+  RColorBrewer::brewer.pal(12, name = "Paired"),
+  pals::glasbey(32)[-4],
+  RColorBrewer::brewer.pal(9, name = "Set1"),
+  RColorBrewer::brewer.pal(8, name = "Set2"),
+  RColorBrewer::brewer.pal(12, name = "Set3"),
+  RColorBrewer::brewer.pal(9, name = "Pastel1"),
+  RColorBrewer::brewer.pal(8, name = "Pastel2"),
+  RColorBrewer::brewer.pal(8, name = "Accent"),
+  RColorBrewer::brewer.pal(8, name = "Dark2")
+)
+color_expression <- pals::jet(n = 50)
+```
+
+```{r}
+clustering_table <- analysis_state$collapsed_duplicates$clustering_table
+categorical_columns <- names(clustering_table)[1:4]
+feature_columns <- names(clustering_table)[5:ncol(clustering_table)]
+
+seurat_meta <- clustering_table[, categorical_columns, drop = FALSE]
+seurat_meta$node_id <- as.numeric(as.character(seurat_meta$node_id))
+seurat_meta$timepoint <- as.numeric(as.character(seurat_meta$timepoint))
+
+corrected_tracks <- analysis_state$duplicate_resolution$corrected_tracks
+seurat_meta <- merge(seurat_meta, corrected_tracks, all.x = TRUE, all.y = FALSE)
+
+tracking_matrix <- t(as.matrix(clustering_table[, feature_columns, drop = FALSE]))
+colnames(tracking_matrix) <- rownames(clustering_table)
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_pca.rds"),
+  function() {
+    object <- suppressWarnings(
+      CreateSeuratObject(
+        counts = tracking_matrix,
+        assay = "IM",
+        meta.data = seurat_meta,
+        project = "Tracking"
+      )
+    )
+    DefaultAssay(object) <- "IM"
+    VariableFeatures(object) <- rownames(object[["IM"]])
+    object |>
+      ScaleData(verbose = FALSE) |>
+      RunPCA(verbose = FALSE)
+  }
+)
+```
+
+## PCA and clustering
+
+```{r}
+std_pc <- Stdev(SO, reduction = "pca")
+elbow_point <- estimate_elbow_point(std_pc)
+pcas <- seq_len(elbow_point)
+
+ggplot(data.frame(PC = seq_along(std_pc), STD = std_pc), aes(x = PC, y = STD)) +
+  geom_point() +
+  geom_vline(xintercept = elbow_point, colour = "red") +
+  ggtitle(paste("Elbow point:", elbow_point)) +
+  theme_bw()
+```
+
+```{r}
+use_assay <- "IM"
+resolutions <- c(0.1, 0.2, 0.5, 0.75)
+clustering_names <- paste0(use_assay, "_snn_res.", resolutions)
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_clusters.rds"),
+  function() {
+    clustered <- FindNeighbors(SO, dims = pcas, reduction = "pca")
+    clustered <- FindClusters(clustered, resolution = resolutions, verbose = FALSE)
+
+    for (cluster_name in clustering_names) {
+      clustered[[cluster_name]] <- as.factor(
+        paste0("C", stringr::str_pad(clustered[[cluster_name]][, 1], 2, pad = "0"))
+      )
+    }
+
+    clustered
+  }
+)
+
+cluster_counts <- SO@meta.data[, clustering_names, drop = FALSE] |>
+  tidyr::pivot_longer(cols = dplyr::everything(), names_to = "resolution", values_to = "cluster") |>
+  dplyr::count(resolution, cluster, name = "n_cells")
+
+knitr::kable(cluster_counts, caption = "Cluster sizes across tested resolutions")
+```
+
+## tSNE and UMAP
+
+```{r}
+selected_resolution <- 0.5
+resolution_name <- paste0(use_assay, "_snn_res.", selected_resolution)
+SO <- SetIdent(SO, value = resolution_name)
+DefaultAssay(SO) <- use_assay
+
+selected_perplexity <- 200
+selected_neighbors <- 50
+selected_min_distance <- 0.3
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_embeddings_final.rds"),
+  function() {
+    object <- SO
+    object <- RunTSNE(
+      object,
+      assay = use_assay,
+      dims = pcas,
+      seed.use = 123456,
+      perplexity = selected_perplexity,
+      check_duplicates = FALSE,
+      reduction.name = "tSNE.Final",
+      reduction.key = "tSNE_",
+      verbose = FALSE
+    )
+    object <- RunUMAP(
+      object,
+      dims = pcas,
+      seed.use = 123456,
+      n.neighbors = selected_neighbors,
+      min.dist = selected_min_distance,
+      reduction.name = "UMAP.Final",
+      reduction.key = "UMAP_",
+      verbose = FALSE
+    )
+    object
+  }
+)
+```
+
+```{r fig.width=12, fig.asp=0.35}
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_final.rds"),
+  function() {
+    final_object <- SetIdent(SO, value = resolution_name)
+    final_object$res.Final <- final_object[[resolution_name]][, 1]
+    SetIdent(final_object, value = "res.Final")
+  }
+)
+
+SO <- add_annotations_to_seurat(SO, analysis_state$node_mapping, ntimepoints = 5)
+
+DimPlot(
+  SO,
+  reduction = "tSNE.Final",
+  group.by = "cell_type",
+  cols = colors_samples,
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "tSNE.Final",
+    group.by = "res.Final",
+    cols = colors_clusters,
+    shuffle = TRUE
+  )
+```
+
+```{r fig.width=12, fig.asp=0.35}
+DimPlot(
+  SO,
+  reduction = "UMAP.Final",
+  group.by = "cell_type",
+  cols = colors_samples,
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "UMAP.Final",
+    group.by = "res.Final",
+    cols = colors_clusters,
+    shuffle = TRUE
+  )
+```
+
+```{r fig.width=12, fig.asp=0.4}
+FeaturePlot(
+  SO,
+  reduction = "UMAP.Final",
+  features = c("node_id2", "ntimepoint"),
+  combine = TRUE
+) &
+  scale_colour_gradientn(colors = color_expression, na.value = "grey90")
+```
+
+```{r fig.width=12, fig.asp=0.4}
+selected_features <- c(
+  "trackLength_win1",
+  "maxDisplacement_win20",
+  "straightness_win20",
+  "asphericity_win20",
+  "DistBorderMean_win20",
+  "overallAngle_win20"
+)
+selected_features <- gsub("_", "-", selected_features, fixed = TRUE)
+
+FeaturePlot(
+  SO,
+  reduction = "UMAP.Final",
+  features = selected_features[selected_features %in% VariableFeatures(SO)],
+  combine = TRUE
+) &
+  scale_colour_gradientn(colors = color_expression, na.value = "grey90")
+```
+
+```{r fig.width=12, fig.asp=0.6}
+DimPlot(
+  SO,
+  reduction = "UMAP.Final",
+  group.by = "cell_type_detailed",
+  cols = RColorBrewer::brewer.pal(8, "Set1"),
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "UMAP.Final",
+    group.by = "Embryo",
+    cols = RColorBrewer::brewer.pal(8, "Set2"),
+    shuffle = TRUE
+  )
+```
+
+# Reference Comparison
+
+```{r}
+reference_checks <- dplyr::bind_rows(
+  cbind(
+    artifact = "clean_wide_nodups",
+    compare_with_reference(
+      analysis_state$collapsed_duplicates$clustering_table,
+      paths$legacy_clean_wide
+    )
+  ),
+  cbind(
+    artifact = "longitudinal_stats",
+    compare_with_reference(
+      analysis_state$model_results,
+      paths$legacy_stats
+    )
+  )
+)
+
+knitr::kable(reference_checks, caption = "Structural comparison against legacy reference files")
+```
+
+# Output Files
+
+Generated tables and caches are written to `r paths$output_root`.
+
+```{r}
+generated_files <- data.frame(
+  file = sort(list.files(paths$output_root, recursive = TRUE))
+)
+
+knitr::kable(generated_files, caption = "Files generated by the refactored notebook")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
