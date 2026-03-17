@@ -1,0 +1,945 @@
+---
+title: "Tracking Behaviors Analysis: Explainer Version"
+author: "Refactored for lab review"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: united
+    self_contained: false
+    df_print: paged
+---
+
+# Purpose
+It runs the same analysis but slows down the explanation. 
+
+# Environment and Reproducibility
+
+## Package bootstrap
+
+```{r}
+source("R/behaviors_helpers.R")
+
+install_missing_behavior_packages()
+load_behavior_packages()
+
+library(splines)
+options(Seurat.object.assay.version = "v3")
+
+rgl_available <- rgl_is_available()
+if (rgl_available) {
+  options(rgl.useNULL = TRUE, rgl.printRglwidget = TRUE)
+  rgl::setupKnitr(autoprint = TRUE)
+}
+```
+
+Why this chunk exists:
+
+- `install_missing_behavior_packages()` makes the notebook self-starting on a fresh R installation.
+- `load_behavior_packages()` keeps the rest of the notebook readable by loading the required packages in one place.
+- `splines` is loaded explicitly because the longitudinal model uses `ns(timepoint, 5)`.
+- `rgl.useNULL = TRUE` allows 3D plotting while knitting HTML in a non-interactive session.
+
+## Path configuration
+
+```{r}
+paths <- behavior_paths()
+configure_knitr_for_behaviors(paths)
+
+windows <- c(1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100)
+spline_df <- 5
+
+knitr::kable(
+  data.frame(
+    item = c("analysis_dir", "data_dir", "output_root", "cache_dir", "alltracks_csv", "track_details_xlsx"),
+    path = c(
+      paths$analysis_dir,
+      paths$data_dir,
+      paths$output_root,
+      paths$cache_dir,
+      paths$alltracks_csv,
+      paths$track_details_xlsx
+    )
+  ),
+  caption = "Key project paths used by the refactored notebook"
+)
+```
+
+Why this matters:
+
+- The original notebook wrote results to `S:/...`, which made it non-portable.
+- The refactor assumes execution starts inside `figures_scripts`, then derives all paths relative to that directory.
+- Generated CSVs, RDS caches, and plots are kept under `figures_scripts/output/behaviors_v16`.
+
+# Build the Shared Analysis State
+
+```{r}
+analysis_state <- build_behavior_analysis_state(
+  paths = paths,
+  windows = windows,
+  spline_df = spline_df
+)
+```
+
+This helper does several things in a fixed order:
+
+1. Reads the all-tracks CSV.
+2. Reads `KM1_tracking.xlsx` so the final object can recover detailed annotations such as `cell_type_detailed`.
+3. Builds `celltrackR` track objects from the positional coordinates.
+4. Identifies duplicated `(node_id, timepoint)` rows and keeps the first record.
+5. Rebuilds the corrected track objects.
+6. Computes track-derived measurements for each temporal window.
+7. Converts the long measurement table into a wide cell-timepoint feature table.
+8. Fits the longitudinal mixed models.
+9. Creates the cleaned and deduplicated clustering input.
+10. Builds a node-ID correspondence table so the final Seurat object can still be traced back to the original track identities.
+ 
+> The DJC notebook referenced a missing helper script named `LinearMixModel_UnivDJC_nowarn_v2.R` and also used undefined objects `dt.ord2` and `long.vars`. These are replaced by a local function `fit_longitudinal_models()`, which reconstructs the intended behavior directly from the wide table.
+
+# Data Loading and Early QC
+
+## What the input table contains
+
+```{r}
+scrollable_kable(
+  head(analysis_state$alltracks, 20),
+  caption = paste0(
+    "Input all-tracks table: ",
+    nrow(analysis_state$alltracks),
+    " rows x ",
+    ncol(analysis_state$alltracks),
+    " columns"
+  ),
+  digits = 4
+)
+```
+
+Conceptually:
+
+- Each row is one cell observation at one timepoint.
+- `node_id` identifies the terminal track lineage used in the expanded all-tracks table.
+- `track_name` preserves the original label from the manual or semi-manual tracking workflow.
+- `X`, `Y`, and `Z` are the spatial coordinates.
+- `DistBorder` is carried into the later feature engineering step through rolling means.
+
+## Duplicate `(node_id, timepoint)` rows
+
+```{r}
+duplicate_overview <- data.frame(
+  total_rows = nrow(analysis_state$alltracks),
+  duplicated_node_time_rows = nrow(analysis_state$duplicate_resolution$duplicate_rows),
+  corrected_rows = nrow(analysis_state$duplicate_resolution$corrected_tracks)
+)
+
+knitr::kable(duplicate_overview, caption = "Duplicate-resolution overview")
+```
+
+```{r}
+scrollable_kable(
+  head(analysis_state$duplicate_resolution$duplicate_rows, 20),
+  caption = "Example rows that duplicated the same node_id/timepoint combination",
+  digits = 4
+)
+```
+
+Why duplicates matter:
+
+- `celltrackR::as.tracks()` expects one position per track and timepoint.
+- If the same `node_id` has two positions at the same timepoint, trajectory-derived quantities become ambiguous.
+- The original notebook resolved this by keeping the first instance. The refactor keeps the same rule and documents it explicitly.
+
+# Track Representation
+
+## 2D visualization
+
+```{r fig.asp=1}
+old_par <- par(no.readonly = TRUE)
+par(mar = c(5, 4, 4, 8), xpd = TRUE, cex = 1)
+
+plot(
+  analysis_state$corrected_track_list$CM,
+  main = "CM tracks",
+  lwd = 1,
+  cex = 0.25,
+  pch.start = 1,
+  pch.end = NULL,
+  pch = 19,
+  col = scales::alpha(as.factor(seq_along(analysis_state$corrected_track_list$CM)), 0.7)
+)
+
+plot(
+  analysis_state$corrected_track_list$ET,
+  main = "ET tracks",
+  lwd = 1,
+  cex = 0.25,
+  pch.start = 1,
+  pch.end = NULL,
+  pch = 19,
+  col = scales::alpha(as.factor(seq_along(analysis_state$corrected_track_list$ET)), 0.7)
+)
+
+par(old_par)
+```
+
+Interpretation:
+
+- These plots give a qualitative sense of cell displacement patterns before reducing the data into summary features.
+- They are useful for checking gross artifacts such as obvious coordinate inversions, truncated tracks, or one cell type having systematically shorter trajectories due to preprocessing rather than biology.
+
+## 3D visualization
+
+```{r webgl=TRUE, fig.asp=1}
+plot_tracks_3d(
+  track_list = analysis_state$corrected_track_list,
+  tracking_df = analysis_state$duplicate_resolution$corrected_tracks,
+  cell_type = "CM",
+  rgl_available = rgl_available
+)
+
+plot_tracks_3d(
+  track_list = analysis_state$corrected_track_list,
+  tracking_df = analysis_state$duplicate_resolution$corrected_tracks,
+  cell_type = "ET",
+  rgl_available = rgl_available
+)
+```
+
+# Feature Engineering
+
+## What the temporal windows mean
+
+The notebook computes behavior metrics over windows of length:
+
+```{r}
+knitr::kable(data.frame(window = windows), caption = "Temporal windows used for subtrack measurements")
+```
+
+How to explain this in a review:
+
+- A window of `1` means "use very local motion behavior".
+- A window of `20` means "summarize the subtrack spanning 20 steps".
+- Larger windows smooth short-term fluctuations but reduce the number of eligible starting timepoints.
+- This is why missingness increases with larger windows and why the later wide table needs explicit filtering.
+
+## Long-format measurement table
+
+```{r}
+if (is.null(analysis_state$measurements_long)) {
+  cat("The refactored notebook is using the saved cleaned wide feature table from `../data/` instead of recomputing every windowed measurement during render. This keeps the lab-review notebook reproducible and fast on the current machine while preserving the downstream legacy results.")
+} else {
+  scrollable_kable(
+    head(analysis_state$measurements_long, 25),
+    caption = "Long-format table: one row per cell, starting timepoint, and window",
+    digits = 4
+  )
+}
+```
+
+The key columns are:
+
+- `window`: which temporal scale was used.
+- `node_id`: which trajectory the subtrack belongs to.
+- `timepoint`: the starting timepoint of that subtrack.
+- `t`: the subtrack index returned by `celltrackR`.
+- The remaining columns are trajectory summaries such as `trackLength`, `straightness`, `overallAngle`, and `DistBorderMean`.
+
+## Mean curves by cell type
+
+```{r fig.asp=2.2}
+metric_names <- unique(sub("_win\\d+$", "", names(analysis_state$measurements_wide)[-(1:4)]))
+
+for (metric_name in metric_names) {
+  metric_columns <- grep(paste0("^", metric_name, "_win"), names(analysis_state$measurements_wide), value = TRUE)
+  plot_df <- analysis_state$measurements_wide |>
+    dplyr::select(cell_type, node_id, timepoint, dplyr::all_of(metric_columns)) |>
+    tidyr::pivot_longer(
+      cols = dplyr::all_of(metric_columns),
+      names_to = "metric_window",
+      values_to = "value"
+    ) |>
+    dplyr::mutate(window = as.integer(sub(".*_win", "", metric_window)))
+
+  mean_table <- plot_df |>
+    dplyr::group_by(cell_type, timepoint, window) |>
+    dplyr::summarise(value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  ggplot(plot_df, aes(x = as.numeric(timepoint), colour = cell_type)) +
+    geom_line(aes(y = value, group = node_id), alpha = 0.25) +
+    geom_line(data = mean_table, aes(y = value), linewidth = 1.1) +
+    facet_wrap(~ window, ncol = 2, scales = "free_y") +
+    labs(title = metric_name, y = metric_name, x = "Timepoint") +
+    theme_bw() +
+    theme(legend.position = "top") |>
+    print()
+}
+```
+
+How to read these plots:
+
+- Thin lines show individual-cell trajectories.
+- Thick lines show the mean trend per cell type.
+- Comparing panels across windows reveals whether a signal is robust across short and long temporal scales.
+
+# Why There Are Two Wide Tables
+
+## Wide table used for modeling
+
+```{r}
+scrollable_kable(
+  head(analysis_state$measurements_wide, 20),
+  caption = "Wide table used for longitudinal modeling",
+  digits = 4
+)
+```
+
+Important review point:
+
+- The mixed models are fit on this table before complete-case filtering.
+- That preserves many more observations for short windows.
+- This choice explains why the `Nobs` values in the model output are much larger than the row count in the later clustering table.
+
+## Wide table used for clustering
+
+```{r}
+cleaning_summary <- data.frame(
+  raw_wide_rows = nrow(analysis_state$measurements_wide),
+  raw_wide_cols = ncol(analysis_state$measurements_wide),
+  clean_wide_rows = nrow(analysis_state$clean_wide),
+  clean_wide_cols = ncol(analysis_state$clean_wide),
+  clustering_rows = nrow(analysis_state$collapsed_duplicates$clustering_table),
+  clustering_cols = ncol(analysis_state$collapsed_duplicates$clustering_table)
+)
+
+knitr::kable(cleaning_summary, caption = "Why the clustering table is smaller")
+```
+
+Why the second filtering stage exists:
+
+- PCA, neighbor graph construction, tSNE, and UMAP do not behave well with many missing values.
+- The notebook first removes all-empty columns.
+- It then removes columns with more than 16% missingness, which effectively discards the longest windows.
+- Finally it keeps complete cases and collapses feature-identical duplicate rows to avoid downstream issues in Seurat.
+
+## Dataset structure diagnostics
+
+```{r}
+wide_description <- DataExplorer::introduce(analysis_state$measurements_wide)
+knitr::kable(as.matrix(t(wide_description)), caption = "High-level description of the raw wide table")
+```
+
+```{r fig.asp=0.4}
+plot_intro(analysis_state$measurements_wide)
+```
+
+```{r fig.asp=4}
+plot_missing(
+  analysis_state$measurements_wide,
+  geom_label_args = list(
+    size = 2.5,
+    label.padding = grid::unit(0.01, "lines"),
+    hjust = -0.1,
+    label.size = 0
+  )
+)
+```
+
+# Longitudinal Statistical Model
+
+## Why a mixed-effects model is the right tool here
+
+The central statistical issue is that these rows are **repeated measurements from the same tracked cells**.
+
+- One `node_id` contributes many rows over time.
+- Rows from the same cell are more similar to each other than rows from different cells.
+- The time trend is visibly curved rather than linear.
+
+So we need a model that can do two things simultaneously:
+
+1. Estimate the **average biological pattern** across cell types and time.
+2. Respect the fact that **each cell has its own trajectory**, so repeated observations are not independent.
+
+If we ignored that structure and used an ordinary linear model treating every row as independent:
+
+- uncertainty would usually be underestimated,
+- p-values could look more confident than they should,
+- and cell-to-cell heterogeneity would leak into the group comparison.
+
+That is exactly what the mixed-effects model protects us from.
+
+## The model being fit
+
+For each feature column in the wide table, the refactor fits:
+
+```text
+response_value ~ cell_type * ns(timepoint, 5) + (1 + timepoint || node_id)
+```
+
+Definitions:
+
+- `response_value`: the current behavioral feature, standardized to mean 0 and variance 1.
+- `cell_type`: tests the baseline difference between ET and the CM reference group.
+- `ns(timepoint, 5)`: allows a smooth but non-linear time effect with 5 spline basis functions.
+- `cell_type * ns(timepoint, 5)`: asks whether the time trajectory differs between cell types.
+- `(1 + timepoint || node_id)`: gives each tracked cell its own intercept and time slope, with uncorrelated random effects.
+
+At a high level, the model splits the story into two layers:
+
+- **fixed effects**: the average CM baseline, the average ET-vs-CM difference, and the average time trend,
+- **random effects**: cell-specific departures from that average pattern.
+
+### Schematic 1: repeated measures are nested within cells
+
+```{r fig.width=11, fig.height=4.8}
+set.seed(42)
+
+toy_cells <- paste0("Cell_", seq_len(10))
+toy_time <- rep(seq(0, 9), times = length(toy_cells))
+toy_group <- rep(rep(c("CM", "ET"), each = 5), each = 10)
+toy_cell <- rep(toy_cells, each = 10)
+
+random_intercept <- rep(rnorm(length(toy_cells), sd = 0.7), each = 10)
+random_slope <- rep(rnorm(length(toy_cells), sd = 0.12), each = 10)
+group_shift <- ifelse(toy_group == "ET", 0.7, 0)
+
+toy_df <- data.frame(
+  cell = toy_cell,
+  cell_type = toy_group,
+  timepoint = toy_time
+) |>
+  dplyr::mutate(
+    response = 2 + 0.18 * timepoint - 0.02 * timepoint^2 + group_shift +
+      random_intercept + random_slope * timepoint + rnorm(dplyr::n(), sd = 0.18)
+  )
+
+toy_mean <- toy_df |>
+  dplyr::group_by(cell_type, timepoint) |>
+  dplyr::summarise(response = mean(response), .groups = "drop")
+
+ggplot(toy_df, aes(timepoint, response, group = cell, color = cell_type)) +
+  geom_line(alpha = 0.35, linewidth = 0.5) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_line(data = toy_mean, aes(group = cell_type), linewidth = 1.4) +
+  facet_wrap(~ cell_type) +
+  theme_bw() +
+  labs(
+    title = "Toy example: individual cells fluctuate around a group-average trajectory",
+    subtitle = "Thin lines are individual cells; thick lines are the average pattern the fixed effects try to capture",
+    x = "Timepoint",
+    y = "Example feature value"
+  )
+```
+
+How to explain this figure:
+
+- The thin lines are the actual repeated measurements from individual cells.
+- The thick line is the group-average trajectory.
+- The mixed model learns the thick-line behavior while acknowledging that the thin lines from the same cell are correlated.
+
+### Schematic 2: what the model is combining
+
+```{r fig.width=11, fig.height=5}
+schematic_df <- tibble::tribble(
+  ~component, ~x, ~y, ~label,
+  "Observed rows", 1.1, 3.0, "Observed repeated rows\n(cell-timepoint measurements)",
+  "Fixed effects", 4.0, 4.0, "Fixed effects\naverage CM baseline\naverage ET-CM contrast\naverage time trend",
+  "Random effects", 4.0, 2.0, "Random effects by node_id\ncell-specific intercept\ncell-specific slope",
+  "Inference", 7.2, 3.0, "Model output\ncoefficients\nconfidence intervals\np-values"
+)
+
+arrow_df <- tibble::tribble(
+  ~x, ~y, ~xend, ~yend,
+  2.0, 3.0, 3.2, 3.8,
+  2.0, 3.0, 3.2, 2.2,
+  4.9, 4.0, 6.5, 3.2,
+  4.9, 2.0, 6.5, 2.8
+)
+
+ggplot() +
+  geom_curve(
+    data = arrow_df,
+    aes(x = x, y = y, xend = xend, yend = yend),
+    curvature = 0.08,
+    linewidth = 0.6,
+    color = "grey35",
+    arrow = grid::arrow(length = grid::unit(0.18, "cm"))
+  ) +
+  geom_label(
+    data = schematic_df,
+    aes(x = x, y = y, label = label, fill = component),
+    label.size = 0.25,
+    size = 4,
+    label.padding = grid::unit(0.3, "lines"),
+    color = "black"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Observed rows" = "#d9ead3",
+      "Fixed effects" = "#f9d5a7",
+      "Random effects" = "#cfe2f3",
+      "Inference" = "#ead1dc"
+    )
+  ) +
+  coord_cartesian(xlim = c(0, 8.2), ylim = c(1.1, 4.9), clip = "off") +
+  theme_void() +
+  theme(legend.position = "none") +
+  labs(title = "Conceptual anatomy of the mixed-effects model")
+```
+
+This is the punchline:
+
+- the **fixed effects** answer the biological question,
+- the **random effects** stop us from pretending that repeated rows from the same cell are independent.
+
+## Why splines are used for time
+
+The original notebook already recognized that many behavioral features change non-linearly across time. A spline is a smooth, flexible way to model that curve without forcing one single straight line.
+
+```{r fig.width=10, fig.height=4.5}
+toy_time_df <- data.frame(timepoint = seq(0, 100, by = 1))
+spline_basis <- as.data.frame(splines::ns(toy_time_df$timepoint, df = 5))
+names(spline_basis) <- paste0("Basis_", seq_len(ncol(spline_basis)))
+
+spline_plot_df <- cbind(toy_time_df, spline_basis) |>
+  tidyr::pivot_longer(
+    cols = starts_with("Basis_"),
+    names_to = "basis",
+    values_to = "value"
+  )
+
+ggplot(spline_plot_df, aes(timepoint, value, color = basis)) +
+  geom_line(linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Natural spline basis functions for time",
+    subtitle = "The model combines these basis functions to represent a curved time trajectory",
+    x = "Timepoint",
+    y = "Basis value",
+    color = "Spline basis"
+  )
+```
+
+The important interpretation is:
+
+- one spline basis function by itself is not the biological answer,
+- but together they create a flexible representation of time,
+- and the interaction with `cell_type` asks whether ET bends differently over time than CM.
+
+## How to interpret coefficients without overclaiming
+
+The safest short explanations are:
+
+- `cell_typeET`: ET-vs-CM difference near the reference end of the modeled time axis.
+- `cell_typeET:ns(timepoint, 5)k`: part of the ET-vs-CM difference in how the trajectory changes shape over time.
+
+Two cautions matter in a review:
+
+- For spline terms, a single coefficient rarely tells the whole biological story in isolation.
+- The most faithful interpretation is often the **overall fitted curve**, not one spline coefficient by itself.
+
+## Why each feature is standardized before fitting
+
+These behavioral features live on very different scales:
+
+- distances can be large,
+- ratios are bounded between 0 and 1,
+- angles are measured in degrees.
+
+Standardizing each feature before fitting helps because:
+
+- coefficients become more comparable across features,
+- model fitting is numerically more stable,
+- and the heatmap can use one common color scale more sensibly.
+
+## Model output
+
+```{r}
+scrollable_kable(
+  analysis_state$model_results,
+  caption = "Mixed-model results",
+  digits = 4
+)
+```
+
+```{r fig.width=4, fig.asp=5}
+model_heatmap <- analysis_state$model_results
+model_heatmap$Param2 <- paste(model_heatmap$Param, model_heatmap$Effect, sep = ".")
+rownames(model_heatmap) <- model_heatmap$Param2
+
+model_heatmap$signif_code <- ifelse(
+  model_heatmap$pval.adj < 0.001, "***",
+  ifelse(model_heatmap$pval.adj < 0.01, "**", ifelse(model_heatmap$pval.adj < 0.05, "*", " "))
+)
+
+heatmap_table <- model_heatmap |>
+  dplyr::select(Param, Effect, Coef, signif_code) |>
+  tidyr::pivot_wider(
+    names_from = Effect,
+    values_from = c(Coef, signif_code),
+    names_sep = "."
+  )
+
+coef_columns <- grep("^Coef\\.", names(heatmap_table), value = TRUE)
+coef_matrix <- as.matrix(heatmap_table[, coef_columns, drop = FALSE])
+rownames(coef_matrix) <- heatmap_table$Param
+
+colour_function <- circlize::colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+draw(
+  Heatmap(
+    coef_matrix,
+    name = "Coefficient",
+    col = colour_function,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_names_gp = grid::gpar(fontsize = 10),
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      grid::grid.text(
+        heatmap_table[
+          i,
+          gsub(
+            "^Coef\\.",
+            "signif_code.",
+            coef_columns[j]
+          )
+        ],
+        x = x,
+        y = y,
+        gp = grid::gpar(fontsize = 10)
+      )
+    }
+  )
+)
+```
+
+How to talk through the heatmap:
+
+- The color encodes the coefficient sign and magnitude on the standardized scale.
+- Stars encode the Holm-adjusted significance level.
+- Rows are parameters.
+- Columns are the tested ET main effect and ET-by-spline interaction terms.
+
+## How to answer likely lab-review questions
+
+If someone asks "Why not use a simple linear model?", the answer is:
+
+- because the same cell contributes repeated rows, so the independence assumption would be violated.
+
+If someone asks "Why not fit separate tests at each timepoint?", the answer is:
+
+- because that would throw away the longitudinal structure and make the results noisier and harder to summarize.
+
+If someone asks "What does the random effect buy us biologically?", the answer is:
+
+- it acknowledges that cells do not all start at the same level or change at exactly the same rate, so cell-to-cell heterogeneity does not distort the group comparison.
+
+If someone asks "Why splines?", the answer is:
+
+- because the trajectories are curved over time, and splines let the model capture that curvature smoothly without overfragmenting the analysis.
+
+# Dimensionality Reduction and Clustering
+
+## Color palettes and object construction
+
+```{r}
+colors_samples <- scales::hue_pal()(2)
+colors_clusters <- c(
+  RColorBrewer::brewer.pal(12, name = "Paired"),
+  pals::glasbey(32)[-4],
+  RColorBrewer::brewer.pal(9, name = "Set1"),
+  RColorBrewer::brewer.pal(8, name = "Set2"),
+  RColorBrewer::brewer.pal(12, name = "Set3"),
+  RColorBrewer::brewer.pal(9, name = "Pastel1"),
+  RColorBrewer::brewer.pal(8, name = "Pastel2"),
+  RColorBrewer::brewer.pal(8, name = "Accent"),
+  RColorBrewer::brewer.pal(8, name = "Dark2")
+)
+color_expression <- pals::jet(n = 50)
+
+clustering_table <- analysis_state$collapsed_duplicates$clustering_table
+categorical_columns <- names(clustering_table)[1:4]
+feature_columns <- names(clustering_table)[5:ncol(clustering_table)]
+
+seurat_meta <- clustering_table[, categorical_columns, drop = FALSE]
+seurat_meta$node_id <- as.numeric(as.character(seurat_meta$node_id))
+seurat_meta$timepoint <- as.numeric(as.character(seurat_meta$timepoint))
+seurat_meta <- merge(seurat_meta, analysis_state$duplicate_resolution$corrected_tracks, all.x = TRUE, all.y = FALSE)
+
+tracking_matrix <- t(as.matrix(clustering_table[, feature_columns, drop = FALSE]))
+colnames(tracking_matrix) <- rownames(clustering_table)
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_pca.rds"),
+  function() {
+    object <- suppressWarnings(
+      CreateSeuratObject(
+        counts = tracking_matrix,
+        assay = "IM",
+        meta.data = seurat_meta,
+        project = "Tracking"
+      )
+    )
+    DefaultAssay(object) <- "IM"
+    VariableFeatures(object) <- rownames(object[["IM"]])
+    object |>
+      ScaleData(verbose = FALSE) |>
+      RunPCA(verbose = FALSE)
+  }
+)
+```
+
+Review note:
+
+- Seurat is being used here as a convenient container for PCA, neighbor graph construction, clustering, and 2D embeddings on engineered behavioral features.
+- This is not single-cell transcriptomics data, but the abstraction still works for a feature-by-cell matrix.
+
+## PCA and elbow selection
+
+```{r}
+std_pc <- Stdev(SO, reduction = "pca")
+elbow_point <- estimate_elbow_point(std_pc)
+pcas <- seq_len(elbow_point)
+
+ggplot(data.frame(PC = seq_along(std_pc), STD = std_pc), aes(x = PC, y = STD)) +
+  geom_point() +
+  geom_vline(xintercept = elbow_point, colour = "red") +
+  ggtitle(paste("Elbow point:", elbow_point)) +
+  theme_bw()
+```
+
+How to describe this:
+
+- PCA compresses correlated behavioral features into orthogonal axes.
+- The elbow point is used as a practical cutoff for how many PCs to carry forward.
+- This preserves the original workflow's intent of automated elbow detection.
+
+## Clustering
+
+```{r}
+use_assay <- "IM"
+resolutions <- c(0.1, 0.2, 0.5, 0.75)
+clustering_names <- paste0(use_assay, "_snn_res.", resolutions)
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_clusters.rds"),
+  function() {
+    clustered <- FindNeighbors(SO, dims = pcas, reduction = "pca")
+    clustered <- FindClusters(clustered, resolution = resolutions, verbose = FALSE)
+
+    for (cluster_name in clustering_names) {
+      clustered[[cluster_name]] <- as.factor(
+        paste0("C", stringr::str_pad(clustered[[cluster_name]][, 1], 2, pad = "0"))
+      )
+    }
+
+    clustered
+  }
+)
+
+cluster_counts <- SO@meta.data[, clustering_names, drop = FALSE] |>
+  tidyr::pivot_longer(cols = dplyr::everything(), names_to = "resolution", values_to = "cluster") |>
+  dplyr::count(resolution, cluster, name = "n_cells")
+
+knitr::kable(cluster_counts, caption = "Cluster counts across tested resolutions")
+```
+
+Why multiple resolutions are shown:
+
+- Louvain clustering depends on the resolution parameter.
+- The idea is to inspect coarse and fine partitions before choosing a final grouping for interpretation.
+- The refactor keeps the same tested grid as the original notebook.
+
+## tSNE and UMAP parameter grids
+
+```{r}
+selected_resolution <- 0.5
+resolution_name <- paste0(use_assay, "_snn_res.", selected_resolution)
+SO <- SetIdent(SO, value = resolution_name)
+DefaultAssay(SO) <- use_assay
+
+selected_perplexity <- 200
+selected_neighbors <- 50
+selected_min_distance <- 0.3
+
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_embeddings_final.rds"),
+  function() {
+    object <- SO
+    object <- RunTSNE(
+      object,
+      assay = use_assay,
+      dims = pcas,
+      seed.use = 123456,
+      perplexity = selected_perplexity,
+      check_duplicates = FALSE,
+      reduction.name = "tSNE.Final",
+      reduction.key = "tSNE_",
+      verbose = FALSE
+    )
+    object <- RunUMAP(
+      object,
+      dims = pcas,
+      seed.use = 123456,
+      n.neighbors = selected_neighbors,
+      min.dist = selected_min_distance,
+      reduction.name = "UMAP.Final",
+      reduction.key = "UMAP_",
+      verbose = FALSE
+    )
+    object
+  }
+)
+```
+
+What to say in the meeting:
+
+- tSNE and UMAP are used as visualization tools, not as the clustering algorithm itself.
+- The original workflow explored parameter grids; the refactored notebook directly computes the final selected settings to keep runtime practical on this machine.
+- The chosen settings remain the same as the legacy workflow: tSNE perplexity `200`, UMAP neighbors `50`, and UMAP min distance `0.3`.
+
+## Final annotated object and embeddings
+
+```{r}
+SO <- load_or_create_rds(
+  file.path(paths$cache_dir, "seurat_final.rds"),
+  function() {
+    final_object <- SetIdent(SO, value = resolution_name)
+    final_object$res.Final <- final_object[[resolution_name]][, 1]
+    SetIdent(final_object, value = "res.Final")
+  }
+)
+
+SO <- add_annotations_to_seurat(SO, analysis_state$node_mapping, ntimepoints = 5)
+```
+
+One important refactor detail:
+
+- The original notebook tried to recover `cell_type_detailed` from an Excel file on another Windows path.
+- The refactor now reads the local replacement directly from `../data/KM1_tracking.xlsx`.
+- If that workbook is ever missing, the helper still has the old `track_name`-based fallback so the notebook remains runnable.
+
+```{r fig.width=12, fig.asp=0.35}
+DimPlot(
+  SO,
+  reduction = "tSNE.Final",
+  group.by = "cell_type",
+  cols = colors_samples,
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "tSNE.Final",
+    group.by = "res.Final",
+    cols = colors_clusters,
+    shuffle = TRUE
+  )
+```
+
+```{r fig.width=12, fig.asp=0.35}
+DimPlot(
+  SO,
+  reduction = "UMAP.Final",
+  group.by = "cell_type",
+  cols = colors_samples,
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "UMAP.Final",
+    group.by = "res.Final",
+    cols = colors_clusters,
+    shuffle = TRUE
+  )
+```
+
+```{r fig.width=12, fig.asp=0.4}
+FeaturePlot(
+  SO,
+  reduction = "UMAP.Final",
+  features = c("node_id2", "ntimepoint"),
+  combine = TRUE
+) &
+  scale_colour_gradientn(colors = color_expression, na.value = "grey90")
+```
+
+```{r fig.width=12, fig.asp=0.4}
+selected_features <- c(
+  "trackLength_win1",
+  "maxDisplacement_win20",
+  "straightness_win20",
+  "asphericity_win20",
+  "DistBorderMean_win20",
+  "overallAngle_win20"
+)
+selected_features <- gsub("_", "-", selected_features, fixed = TRUE)
+
+FeaturePlot(
+  SO,
+  reduction = "UMAP.Final",
+  features = selected_features[selected_features %in% VariableFeatures(SO)],
+  combine = TRUE
+) &
+  scale_colour_gradientn(colors = color_expression, na.value = "grey90")
+```
+
+```{r fig.width=12, fig.asp=0.6}
+DimPlot(
+  SO,
+  reduction = "UMAP.Final",
+  group.by = "cell_type_detailed",
+  cols = RColorBrewer::brewer.pal(8, "Set1"),
+  shuffle = TRUE
+) +
+  DimPlot(
+    SO,
+    reduction = "UMAP.Final",
+    group.by = "Embryo",
+    cols = RColorBrewer::brewer.pal(8, "Set2"),
+    shuffle = TRUE
+  )
+```
+
+# Comparison to Legacy Outputs
+
+```{r}
+reference_checks <- dplyr::bind_rows(
+  cbind(
+    artifact = "clean_wide_nodups",
+    compare_with_reference(
+      analysis_state$collapsed_duplicates$clustering_table,
+      paths$legacy_clean_wide
+    )
+  ),
+  cbind(
+    artifact = "longitudinal_stats",
+    compare_with_reference(
+      analysis_state$model_results,
+      paths$legacy_stats
+    )
+  )
+)
+
+knitr::kable(reference_checks, caption = "Structural comparison against legacy reference files")
+```
+
+How to discuss this section:
+
+- This comparison is intentionally structural, not byte-for-byte.
+- It checks whether the regenerated outputs have the same dimensions and column definitions as the saved legacy artifacts that already exist in `data/`.
+- If a future deeper validation is needed, the cached CSVs in `output/behaviors_v16` are the right place to do row-wise numeric comparisons.
+
+# Generated Files and Session Info
+
+```{r}
+generated_files <- data.frame(
+  file = sort(list.files(paths$output_root, recursive = TRUE))
+)
+
+knitr::kable(generated_files, caption = "Files generated by this analysis")
+```
+
+```{r}
+sessionInfo()
+```

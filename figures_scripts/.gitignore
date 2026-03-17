@@ -34,14 +34,6 @@ __pycache__/
 *.temp
 
 # -----------------------------
-# Rendered documents and reports
-# Keep source .Rmd and .ipynb, ignore rendered outputs
-# -----------------------------
-*.html
-*.nb.html
-*_files/
-
-# -----------------------------
 # Knitr / rmarkdown caches and figure folders
 # -----------------------------
 cache/
@@ -71,8 +63,7 @@ figures_scripts/output/
 # Image outputs commonly generated during analysis
 # Keep if you explicitly want final figures tracked
 # -----------------------------
-*.png
-*.pdf
+
 *.svg
 *.jpeg
 *.jpg

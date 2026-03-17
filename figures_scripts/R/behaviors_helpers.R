@@ -14,6 +14,7 @@ required_behavior_packages <- c(
   pals = "CRAN",
   patchwork = "CRAN",
   plyr = "CRAN",
+  plotly = "CRAN",
   pracma = "CRAN",
   RColorBrewer = "CRAN",
   readxl = "CRAN",
@@ -68,6 +69,47 @@ rgl_is_available <- function() {
     suppressPackageStartupMessages(library(rgl))
     TRUE
   }, error = function(...) FALSE))
+}
+
+plot_tracks_3d <- function(track_list, tracking_df, cell_type, rgl_available = FALSE) {
+  if (rgl_available) {
+    plot3d(track_list[[cell_type]], main = paste(cell_type, "tracks"), tick.marks = FALSE)
+    return(invisible(NULL))
+  }
+
+  plot_df <- tracking_df |>
+    dplyr::filter(cell_type == !!cell_type) |>
+    dplyr::arrange(node_id, timepoint) |>
+    dplyr::mutate(
+      hover_label = paste0(
+        "node_id: ", node_id,
+        "<br>timepoint: ", timepoint,
+        "<br>X: ", round(X, 2),
+        "<br>Y: ", round(Y, 2),
+        "<br>Z: ", round(Z, 2)
+      )
+    )
+
+  plotly::plot_ly(
+    data = plot_df,
+    x = ~X,
+    y = ~Y,
+    z = ~Z,
+    split = ~factor(node_id),
+    type = "scatter3d",
+    mode = "lines",
+    text = ~hover_label,
+    hoverinfo = "text",
+    showlegend = FALSE
+  ) |>
+    plotly::layout(
+      title = paste(cell_type, "tracks"),
+      scene = list(
+        xaxis = list(title = "X"),
+        yaxis = list(title = "Y"),
+        zaxis = list(title = "Z")
+      )
+    )
 }
 
 setup_behavior_project <- function(project_root = "..") {
