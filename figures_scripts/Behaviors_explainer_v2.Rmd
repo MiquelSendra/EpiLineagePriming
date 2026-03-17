@@ -1,6 +1,6 @@
 ---
-title: "Tracking Behaviors Analysis: Explainer Version"
-author: "Refactored for lab review"
+title: "Tracking Behaviors Analysis: Extended ecplanation Version"
+author: "MS based on DJC methods from Crainuculic et al. 2022"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 output:
   html_document:
@@ -35,8 +35,6 @@ if (rgl_available) {
 }
 ```
 
-Why this chunk exists:
-
 - `install_missing_behavior_packages()` makes the notebook self-starting on a fresh R installation.
 - `load_behavior_packages()` keeps the rest of the notebook readable by loading the required packages in one place.
 - `splines` is loaded explicitly because the longitudinal model uses `ns(timepoint, 5)`.
@@ -67,10 +65,7 @@ knitr::kable(
 )
 ```
 
-Why this matters:
-
-- The original notebook wrote results to `S:/...`, which made it non-portable.
-- The refactor assumes execution starts inside `figures_scripts`, then derives all paths relative to that directory.
+- This assumes execution starts inside `figures_scripts`, then derives all paths relative to that directory.
 - Generated CSVs, RDS caches, and plots are kept under `figures_scripts/output/behaviors_v16`.
 
 # Build the Shared Analysis State
@@ -96,7 +91,7 @@ This helper does several things in a fixed order:
 9. Creates the cleaned and deduplicated clustering input.
 10. Builds a node-ID correspondence table so the final Seurat object can still be traced back to the original track identities.
  
-> The DJC notebook referenced a missing helper script named `LinearMixModel_UnivDJC_nowarn_v2.R` and also used undefined objects `dt.ord2` and `long.vars`. These are replaced by a local function `fit_longitudinal_models()`, which reconstructs the intended behavior directly from the wide table.
+> The DJC original code referenced a missing helper script named `LinearMixModel_UnivDJC_nowarn_v2.R` and also used undefined objects `dt.ord2` and `long.vars`. These are replaced by a local function `fit_longitudinal_models()`, which reconstructs the intended behavior directly from the wide table.
 
 # Data Loading and Early QC
 
@@ -215,8 +210,6 @@ The notebook computes behavior metrics over windows of length:
 ```{r}
 knitr::kable(data.frame(window = windows), caption = "Temporal windows used for subtrack measurements")
 ```
-
-How to explain this in a review:
 
 - A window of `1` means "use very local motion behavior".
 - A window of `20` means "summarize the subtrack spanning 20 steps".
@@ -431,8 +424,6 @@ ggplot(toy_df, aes(timepoint, response, group = cell, color = cell_type)) +
   )
 ```
 
-How to explain this figure:
-
 - The thin lines are the actual repeated measurements from individual cells.
 - The thick line is the group-average trajectory.
 - The mixed model learns the thick-line behavior while acknowledging that the thin lines from the same cell are correlated.
@@ -526,10 +517,8 @@ The important interpretation is:
 - but together they create a flexible representation of time,
 - and the interaction with `cell_type` asks whether ET bends differently over time than CM.
 
-## How to interpret coefficients without overclaiming
-
-The safest short explanations are:
-
+## How to interpret coefficients from the model output
+The model output includes coefficients for terms such as:
 - `cell_typeET`: ET-vs-CM difference near the reference end of the modeled time axis.
 - `cell_typeET:ns(timepoint, 5)k`: part of the ET-vs-CM difference in how the trajectory changes shape over time.
 
@@ -614,28 +603,28 @@ draw(
 )
 ```
 
-How to talk through the heatmap:
+heatmap:
 
 - The color encodes the coefficient sign and magnitude on the standardized scale.
 - Stars encode the Holm-adjusted significance level.
 - Rows are parameters.
 - Columns are the tested ET main effect and ET-by-spline interaction terms.
 
-## How to answer likely lab-review questions
+## the model choice
 
-If someone asks "Why not use a simple linear model?", the answer is:
+  "Why not use a simple linear model?", the answer is:
 
 - because the same cell contributes repeated rows, so the independence assumption would be violated.
 
-If someone asks "Why not fit separate tests at each timepoint?", the answer is:
+ "Why not fit separate tests at each timepoint?", the answer is:
 
 - because that would throw away the longitudinal structure and make the results noisier and harder to summarize.
 
-If someone asks "What does the random effect buy us biologically?", the answer is:
+ "What does the random effect matter biologically?", the answer is:
 
 - it acknowledges that cells do not all start at the same level or change at exactly the same rate, so cell-to-cell heterogeneity does not distort the group comparison.
 
-If someone asks "Why splines?", the answer is:
+  "Why splines?", the answer is:
 
 - because the trajectories are curved over time, and splines let the model capture that curvature smoothly without overfragmenting the analysis.
 
@@ -708,8 +697,6 @@ ggplot(data.frame(PC = seq_along(std_pc), STD = std_pc), aes(x = PC, y = STD)) +
   ggtitle(paste("Elbow point:", elbow_point)) +
   theme_bw()
 ```
-
-How to describe this:
 
 - PCA compresses correlated behavioral features into orthogonal axes.
 - The elbow point is used as a practical cutoff for how many PCs to carry forward.
@@ -923,8 +910,6 @@ reference_checks <- dplyr::bind_rows(
 
 knitr::kable(reference_checks, caption = "Structural comparison against legacy reference files")
 ```
-
-How to discuss this section:
 
 - This comparison is intentionally structural, not byte-for-byte.
 - It checks whether the regenerated outputs have the same dimensions and column definitions as the saved legacy artifacts that already exist in `data/`.
